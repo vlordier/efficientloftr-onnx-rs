@@ -111,10 +111,20 @@ impl EfficientLoftrMatcher {
         model_path: impl AsRef<Path>,
         config: EfficientLoftrConfig,
     ) -> Result<Self, EfficientLoftrError> {
-        let session = Session::builder()
+        let thread_count = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(4);
+
+        let mut builder = Session::builder()
             .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?
+            .with_parallel_execution(true)
+            .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?
+            .with_intra_threads(thread_count)
+            .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?;
+
+        let session = builder
             .commit_from_file(model_path)
             .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?;
         Ok(Self { session, config })
