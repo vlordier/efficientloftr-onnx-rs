@@ -364,7 +364,7 @@ def _patch_fine_matching_for_export(matcher: nn.Module, export_safe: bool = Fals
         softmax_matrix_f = softmax_matrix_f.reshape(m, self.WW, self.W + 2, self.W + 2)
         softmax_matrix_f = softmax_matrix_f[..., 1:-1, 1:-1].reshape(m, self.WW, self.WW)
 
-        conf_flat = softmax_matrix_f.reshape(m, -1)
+        conf_flat = softmax_matrix_f.reshape(m, ww * ww)
         mconf, idx = torch.max(conf_flat, dim=-1)
         idx = idx.unsqueeze(-1)
         idx_l = idx // ww
@@ -488,7 +488,16 @@ class BatchedTopKWrapper(nn.Module):
         for batch_idx in range(self.max_batch):
             batch_mask = bids == batch_idx
             batch_scores = torch.where(batch_mask, conf, neg_inf)
-            topk_scores, topk_indices = torch.topk(batch_scores, k=self.max_matches)
+            k = min(self.max_matches, int(batch_scores.numel()))
+            topk_scores, topk_indices = torch.topk(batch_scores, k=k)
+            if k < self.max_matches:
+                pad = self.max_matches - k
+                topk_scores = torch.cat(
+                    [topk_scores, torch.full((pad,), neg_inf, dtype=topk_scores.dtype, device=topk_scores.device)]
+                )
+                topk_indices = torch.cat(
+                    [topk_indices, torch.zeros((pad,), dtype=topk_indices.dtype, device=topk_indices.device)]
+                )
             valid = topk_scores > (neg_inf * 0.5)
             selected0 = mkpts0[topk_indices]
             selected1 = mkpts1[topk_indices]
