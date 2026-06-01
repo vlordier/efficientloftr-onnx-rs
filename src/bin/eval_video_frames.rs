@@ -45,7 +45,7 @@ struct Cli {
     keypoints1_name: String,
     #[arg(long, default_value = "confidence")]
     confidence_name: String,
-    #[arg(long, default_value_t = 0.2)]
+    #[arg(long, default_value_t = 0.0)]
     confidence_threshold: f32,
     #[arg(long, default_value_t = 512)]
     max_matches: usize,

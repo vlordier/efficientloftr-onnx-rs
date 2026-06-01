@@ -28,7 +28,7 @@ impl Default for EfficientLoftrConfig {
             keypoints0_name: "keypoints0".to_string(),
             keypoints1_name: "keypoints1".to_string(),
             confidence_name: "confidence".to_string(),
-            confidence_threshold: 0.2,
+            confidence_threshold: 0.0,
             max_matches: 512,
         }
     }
