@@ -112,18 +112,20 @@ impl EfficientLoftrMatcher {
         image0: &GrayscaleFrame,
         image1: &GrayscaleFrame,
     ) -> Result<MatchOutput, EfficientLoftrError> {
-        if image0.width == 0
-            || image0.height == 0
-            || image1.width != image0.width
-            || image1.height != image0.height
-            || image0.pixels.len() != image0.width * image0.height
-            || image1.pixels.len() != image1.width * image1.height
-        {
-            return Err(EfficientLoftrError::InvalidImageShape);
-        }
+        let mut batch = self.match_batch(&[image0], &[image1])?;
+        batch.pop().ok_or(EfficientLoftrError::InvalidImageShape)
+    }
 
-        let input0 = make_nchw_tensor(image0)?;
-        let input1 = make_nchw_tensor(image1)?;
+    pub fn match_batch(
+        &mut self,
+        images0: &[&GrayscaleFrame],
+        images1: &[&GrayscaleFrame],
+    ) -> Result<Vec<MatchOutput>, EfficientLoftrError> {
+        validate_batch_inputs(images0, images1)?;
+
+        let input0 = make_nchw_tensor_batch(images0)?;
+        let input1 = make_nchw_tensor_batch(images1)?;
+        let batch_size = images0.len();
 
         let available_input_names = self
             .session
@@ -238,38 +240,83 @@ impl EfficientLoftrMatcher {
             .try_extract_array::<f32>()
             .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?;
 
-        let k0 = decode_keypoints(keypoints0.view(), &self.config.keypoints0_name)?;
-        let k1 = decode_keypoints(keypoints1.view(), &self.config.keypoints1_name)?;
-        let conf = decode_confidence(confidence.view(), &self.config.confidence_name)?;
+        let k0_batches =
+            decode_keypoints_batch(keypoints0.view(), &self.config.keypoints0_name, batch_size)?;
+        let k1_batches =
+            decode_keypoints_batch(keypoints1.view(), &self.config.keypoints1_name, batch_size)?;
+        let conf_batches =
+            decode_confidence_batch(confidence.view(), &self.config.confidence_name, batch_size)?;
 
-        let count = k0.len().min(k1.len()).min(conf.len());
-        let mut out0 = Vec::with_capacity(count);
-        let mut out1 = Vec::with_capacity(count);
-        let mut outc = Vec::with_capacity(count);
-        for i in 0..count {
-            if conf[i] < self.config.confidence_threshold {
-                continue;
+        let mut outputs = Vec::with_capacity(batch_size);
+        for batch_idx in 0..batch_size {
+            let k0 = &k0_batches[batch_idx];
+            let k1 = &k1_batches[batch_idx];
+            let conf = &conf_batches[batch_idx];
+
+            let count = k0.len().min(k1.len()).min(conf.len());
+            let mut out0 = Vec::with_capacity(count);
+            let mut out1 = Vec::with_capacity(count);
+            let mut outc = Vec::with_capacity(count);
+            for i in 0..count {
+                if conf[i] < self.config.confidence_threshold {
+                    continue;
+                }
+                out0.push(k0[i]);
+                out1.push(k1[i]);
+                outc.push(conf[i]);
+                if outc.len() >= self.config.max_matches.max(1) {
+                    break;
+                }
             }
-            out0.push(k0[i]);
-            out1.push(k1[i]);
-            outc.push(conf[i]);
-            if outc.len() >= self.config.max_matches.max(1) {
-                break;
-            }
+
+            outputs.push(MatchOutput {
+                keypoints0: out0,
+                keypoints1: out1,
+                confidence: outc,
+            });
         }
 
-        Ok(MatchOutput {
-            keypoints0: out0,
-            keypoints1: out1,
-            confidence: outc,
-        })
+        Ok(outputs)
     }
 }
 
-fn make_nchw_tensor(image: &GrayscaleFrame) -> Result<Tensor<f32>, EfficientLoftrError> {
-    let data: Vec<f32> = image.pixels.iter().map(|v| *v as f32 / 255.0).collect();
-    let array = Array::from_shape_vec((1usize, 1usize, image.height, image.width), data)
-        .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?;
+fn validate_batch_inputs(
+    images0: &[&GrayscaleFrame],
+    images1: &[&GrayscaleFrame],
+) -> Result<(), EfficientLoftrError> {
+    if images0.is_empty() || images0.len() != images1.len() {
+        return Err(EfficientLoftrError::InvalidImageShape);
+    }
+
+    let width = images0[0].width;
+    let height = images0[0].height;
+    for (image0, image1) in images0.iter().zip(images1.iter()) {
+        if image0.width == 0
+            || image0.height == 0
+            || image0.width != width
+            || image0.height != height
+            || image1.width != width
+            || image1.height != height
+            || image0.pixels.len() != image0.width * image0.height
+            || image1.pixels.len() != image1.width * image1.height
+        {
+            return Err(EfficientLoftrError::InvalidImageShape);
+        }
+    }
+
+    Ok(())
+}
+
+fn make_nchw_tensor_batch(images: &[&GrayscaleFrame]) -> Result<Tensor<f32>, EfficientLoftrError> {
+    let data: Vec<f32> = images
+        .iter()
+        .flat_map(|image| image.pixels.iter().map(|v| *v as f32 / 255.0))
+        .collect();
+    let array = Array::from_shape_vec(
+        (images.len(), 1usize, images[0].height, images[0].width),
+        data,
+    )
+    .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?;
     Tensor::from_array(array).map_err(|e| EfficientLoftrError::Ort(e.to_string()))
 }
 
@@ -283,36 +330,44 @@ fn resolve_name(available: &[String], preferred: &str, aliases: &[&str]) -> Opti
         .cloned()
 }
 
-fn decode_keypoints(
+fn decode_keypoints_batch(
     array: ArrayViewD<'_, f32>,
     name: &str,
-) -> Result<Vec<[f32; 2]>, EfficientLoftrError> {
+    expected_batch: usize,
+) -> Result<Vec<Vec<[f32; 2]>>, EfficientLoftrError> {
     match array.shape() {
-        [n, c] if *c >= 2 => {
+        [n, c] if *c >= 2 && expected_batch == 1 => {
             let mut out = Vec::with_capacity(*n);
             for i in 0..*n {
                 out.push([array[[i, 0]], array[[i, 1]]]);
             }
-            Ok(out)
+            Ok(vec![out])
         }
-        [b, n, c] if *b == 1 && *c >= 2 => {
-            let mut out = Vec::with_capacity(*n);
-            for i in 0..*n {
-                out.push([array[[0, i, 0]], array[[0, i, 1]]]);
+        [b, n, c] if *b == expected_batch && *c >= 2 => {
+            let mut batches = Vec::with_capacity(*b);
+            for batch_idx in 0..*b {
+                let mut out = Vec::with_capacity(*n);
+                for i in 0..*n {
+                    out.push([array[[batch_idx, i, 0]], array[[batch_idx, i, 1]]]);
+                }
+                batches.push(out);
             }
-            Ok(out)
+            Ok(batches)
         }
         _ => Err(EfficientLoftrError::InvalidOutputShape(name.to_string())),
     }
 }
 
-fn decode_confidence(
+fn decode_confidence_batch(
     array: ArrayViewD<'_, f32>,
     name: &str,
-) -> Result<Vec<f32>, EfficientLoftrError> {
+    expected_batch: usize,
+) -> Result<Vec<Vec<f32>>, EfficientLoftrError> {
     match array.shape() {
-        [n] => Ok((0..*n).map(|i| array[[i]]).collect()),
-        [b, n] if *b == 1 => Ok((0..*n).map(|i| array[[0, i]]).collect()),
+        [n] if expected_batch == 1 => Ok(vec![(0..*n).map(|i| array[[i]]).collect()]),
+        [b, n] if *b == expected_batch => Ok((0..*b)
+            .map(|batch_idx| (0..*n).map(|i| array[[batch_idx, i]]).collect())
+            .collect()),
         _ => Err(EfficientLoftrError::InvalidOutputShape(name.to_string())),
     }
 }
@@ -321,25 +376,60 @@ fn decode_confidence(
 mod tests {
     use ndarray::Array;
 
-    use super::{decode_confidence, decode_keypoints};
+    use super::{
+        GrayscaleFrame, decode_confidence_batch, decode_keypoints_batch, validate_batch_inputs,
+    };
 
     #[test]
     fn decodes_supported_keypoint_shapes() {
         let k2 = Array::from_shape_vec((2, 2), vec![1.0_f32, 2.0, 3.0, 4.0]).expect("shape");
         let k3 = Array::from_shape_vec((1, 2, 2), vec![1.0_f32, 2.0, 3.0, 4.0]).expect("shape");
-        let out2 = decode_keypoints(k2.view().into_dyn(), "k2").expect("decode k2");
-        let out3 = decode_keypoints(k3.view().into_dyn(), "k3").expect("decode k3");
-        assert_eq!(out2, vec![[1.0, 2.0], [3.0, 4.0]]);
-        assert_eq!(out3, vec![[1.0, 2.0], [3.0, 4.0]]);
+        let k4 = Array::from_shape_vec(
+            (2, 2, 2),
+            vec![1.0_f32, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0],
+        )
+        .expect("shape");
+        let out2 = decode_keypoints_batch(k2.view().into_dyn(), "k2", 1).expect("decode k2");
+        let out3 = decode_keypoints_batch(k3.view().into_dyn(), "k3", 1).expect("decode k3");
+        let out4 = decode_keypoints_batch(k4.view().into_dyn(), "k4", 2).expect("decode k4");
+        assert_eq!(out2, vec![vec![[1.0, 2.0], [3.0, 4.0]]]);
+        assert_eq!(out3, vec![vec![[1.0, 2.0], [3.0, 4.0]]]);
+        assert_eq!(
+            out4,
+            vec![
+                vec![[1.0, 2.0], [3.0, 4.0]],
+                vec![[10.0, 20.0], [30.0, 40.0]]
+            ]
+        );
     }
 
     #[test]
     fn decodes_supported_confidence_shapes() {
         let c1 = Array::from_shape_vec((3,), vec![0.1_f32, 0.2, 0.3]).expect("shape");
         let c2 = Array::from_shape_vec((1, 3), vec![0.1_f32, 0.2, 0.3]).expect("shape");
-        let out1 = decode_confidence(c1.view().into_dyn(), "c1").expect("decode c1");
-        let out2 = decode_confidence(c2.view().into_dyn(), "c2").expect("decode c2");
-        assert_eq!(out1, vec![0.1, 0.2, 0.3]);
-        assert_eq!(out2, vec![0.1, 0.2, 0.3]);
+        let c3 =
+            Array::from_shape_vec((2, 3), vec![0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6]).expect("shape");
+        let out1 = decode_confidence_batch(c1.view().into_dyn(), "c1", 1).expect("decode c1");
+        let out2 = decode_confidence_batch(c2.view().into_dyn(), "c2", 1).expect("decode c2");
+        let out3 = decode_confidence_batch(c3.view().into_dyn(), "c3", 2).expect("decode c3");
+        assert_eq!(out1, vec![vec![0.1, 0.2, 0.3]]);
+        assert_eq!(out2, vec![vec![0.1, 0.2, 0.3]]);
+        assert_eq!(out3, vec![vec![0.1, 0.2, 0.3], vec![0.4, 0.5, 0.6]]);
+    }
+
+    #[test]
+    fn validates_batch_shapes() {
+        let frame = GrayscaleFrame {
+            width: 2,
+            height: 2,
+            pixels: vec![0, 1, 2, 3],
+        };
+        let mismatch = GrayscaleFrame {
+            width: 3,
+            height: 2,
+            pixels: vec![0, 1, 2, 3, 4, 5],
+        };
+        assert!(validate_batch_inputs(&[&frame], &[&frame]).is_ok());
+        assert!(validate_batch_inputs(&[&frame], &[&mismatch]).is_err());
     }
 }

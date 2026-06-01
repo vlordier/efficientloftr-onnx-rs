@@ -9,8 +9,8 @@ use efficientloftr_onnx_rs::{EfficientLoftrConfig, EfficientLoftrMatcher, Graysc
 #[command(name = "eval-video-frames")]
 #[command(about = "Evaluate EfficientLoFTR ONNX matcher on sorted frame sequences")]
 struct Cli {
-    #[arg(long)]
-    model: PathBuf,
+    #[arg(long, required = true)]
+    model: Vec<PathBuf>,
     #[arg(long)]
     frames_dir: PathBuf,
     #[arg(long, default_value = "frame_")]
@@ -19,6 +19,8 @@ struct Cli {
     frame_ext: String,
     #[arg(long)]
     output_csv: Option<PathBuf>,
+    #[arg(long)]
+    summary_csv: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
     start_index: usize,
     #[arg(long)]
@@ -27,6 +29,8 @@ struct Cli {
     step: usize,
     #[arg(long)]
     max_pairs: Option<usize>,
+    #[arg(long, default_value_t = 1)]
+    batch_size: usize,
     #[arg(long, default_value = "image0")]
     input0_name: String,
     #[arg(long, default_value = "image1")]
@@ -47,6 +51,9 @@ fn main() -> Result<(), String> {
     let args = Cli::parse();
     if args.step == 0 {
         return Err("--step must be >= 1".to_string());
+    }
+    if args.batch_size == 0 {
+        return Err("--batch-size must be >= 1".to_string());
     }
 
     let mut frame_paths =
@@ -80,59 +87,180 @@ fn main() -> Result<(), String> {
         max_matches: args.max_matches,
     };
 
-    let mut matcher =
-        EfficientLoftrMatcher::from_model_path(&args.model, config).map_err(|e| e.to_string())?;
+    let pair_specs = collect_pair_specs(&frame_paths, args.step, args.max_pairs);
+    if pair_specs.is_empty() {
+        return Err("no frame pairs were evaluated".to_string());
+    }
 
-    let mut csv_lines = vec!["pair,image0,image1,match_count".to_string()];
-    let mut counts: Vec<usize> = Vec::new();
-    let mut pair_id: usize = 0;
+    let mut pair_csv_lines = vec!["model,pair,image0,image1,match_count".to_string()];
+    let mut summary_csv_lines = vec![
+        "model,status,pairs,mean_matches,min_matches,max_matches,p10,p50,p90,batch_size,elapsed_ms,error"
+            .to_string(),
+    ];
 
+    for model in &args.model {
+        match evaluate_model(model, &config, &pair_specs, args.batch_size) {
+            Ok(summary) => {
+                for (pair_id, image0, image1, count) in &summary.rows {
+                    pair_csv_lines.push(format!(
+                        "{},{},{},{},{}",
+                        model.display(),
+                        pair_id,
+                        image0.display(),
+                        image1.display(),
+                        count
+                    ));
+                }
+                summary_csv_lines.push(format!(
+                    "{},ok,{},{:.2},{},{},{},{},{},{},{},",
+                    model.display(),
+                    summary.counts.len(),
+                    summary.mean,
+                    summary.min,
+                    summary.max,
+                    summary.p10,
+                    summary.p50,
+                    summary.p90,
+                    args.batch_size,
+                    summary.elapsed_ms
+                ));
+
+                println!("model: {}", model.display());
+                println!("status: ok");
+                println!("pairs: {}", summary.counts.len());
+                println!("mean matches: {:.2}", summary.mean);
+                println!("min/max: {}/{}", summary.min, summary.max);
+                println!(
+                    "p10/p50/p90: {}/{}/{}",
+                    summary.p10, summary.p50, summary.p90
+                );
+                println!("elapsed ms: {}", summary.elapsed_ms);
+            }
+            Err(error) => {
+                if args.model.len() == 1 {
+                    return Err(error);
+                }
+                summary_csv_lines.push(format!(
+                    "{},error,,,,,,,,,,{}",
+                    model.display(),
+                    csv_escape(&error)
+                ));
+                println!("model: {}", model.display());
+                println!("status: error");
+                println!("error: {}", error);
+            }
+        }
+    }
+
+    if let Some(path) = args.output_csv {
+        fs::write(path, pair_csv_lines.join("\n") + "\n").map_err(|e| e.to_string())?;
+    }
+
+    if let Some(path) = args.summary_csv {
+        fs::write(path, summary_csv_lines.join("\n") + "\n").map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+struct EvalSummary {
+    counts: Vec<usize>,
+    rows: Vec<(usize, PathBuf, PathBuf, usize)>,
+    mean: f64,
+    min: usize,
+    max: usize,
+    p10: usize,
+    p50: usize,
+    p90: usize,
+    elapsed_ms: u128,
+}
+
+fn collect_pair_specs(
+    frame_paths: &[PathBuf],
+    step: usize,
+    max_pairs: Option<usize>,
+) -> Vec<(usize, PathBuf, PathBuf)> {
+    let mut pair_specs = Vec::new();
+    let mut pair_id = 0usize;
     let mut i = 0usize;
-    while i + args.step < frame_paths.len() {
-        if let Some(limit) = args.max_pairs
+    while i + step < frame_paths.len() {
+        if let Some(limit) = max_pairs
             && pair_id >= limit
         {
             break;
         }
-
-        let frame0 = GrayscaleFrame::from_path(&frame_paths[i]).map_err(|e| e.to_string())?;
-        let frame1 =
-            GrayscaleFrame::from_path(&frame_paths[i + args.step]).map_err(|e| e.to_string())?;
-
-        if frame0.width != frame1.width || frame0.height != frame1.height {
-            return Err(format!(
-                "frame dimensions differ: {} ({:?}x{:?}) vs {} ({:?}x{:?})",
-                frame_paths[i].display(),
-                frame0.width,
-                frame0.height,
-                frame_paths[i + args.step].display(),
-                frame1.width,
-                frame1.height
-            ));
-        }
-
-        let matches = matcher
-            .match_pair(&frame0, &frame1)
-            .map_err(|e| format!("pair {pair_id} failed: {e}"))?;
-        let count = matches.confidence.len();
-        counts.push(count);
-        csv_lines.push(format!(
-            "{},{},{},{}",
+        pair_specs.push((
             pair_id,
-            frame_paths[i].display(),
-            frame_paths[i + args.step].display(),
-            count
+            frame_paths[i].clone(),
+            frame_paths[i + step].clone(),
         ));
         pair_id += 1;
         i += 1;
     }
+    pair_specs
+}
 
-    if counts.is_empty() {
-        return Err("no frame pairs were evaluated".to_string());
+fn evaluate_model(
+    model: &Path,
+    config: &EfficientLoftrConfig,
+    pair_specs: &[(usize, PathBuf, PathBuf)],
+    batch_size: usize,
+) -> Result<EvalSummary, String> {
+    let mut matcher =
+        EfficientLoftrMatcher::from_model_path(model, config.clone()).map_err(|e| e.to_string())?;
+    let started = std::time::Instant::now();
+    let mut rows = Vec::with_capacity(pair_specs.len());
+    let mut counts = Vec::with_capacity(pair_specs.len());
+
+    let mut offset = 0usize;
+    while offset < pair_specs.len() {
+        let upper = cmp::min(offset + batch_size, pair_specs.len());
+        let batch_specs = &pair_specs[offset..upper];
+
+        let mut frames0 = Vec::with_capacity(batch_specs.len());
+        let mut frames1 = Vec::with_capacity(batch_specs.len());
+        for (_, image0, image1) in batch_specs {
+            let frame0 = GrayscaleFrame::from_path(image0).map_err(|e| e.to_string())?;
+            let frame1 = GrayscaleFrame::from_path(image1).map_err(|e| e.to_string())?;
+            if frame0.width != frame1.width || frame0.height != frame1.height {
+                return Err(format!(
+                    "frame dimensions differ: {} ({}x{}) vs {} ({}x{})",
+                    image0.display(),
+                    frame0.width,
+                    frame0.height,
+                    image1.display(),
+                    frame1.width,
+                    frame1.height
+                ));
+            }
+            frames0.push(frame0);
+            frames1.push(frame1);
+        }
+
+        let batch0: Vec<&GrayscaleFrame> = frames0.iter().collect();
+        let batch1: Vec<&GrayscaleFrame> = frames1.iter().collect();
+        let matches = matcher.match_batch(&batch0, &batch1).map_err(|e| {
+            format!(
+                "model {} batch starting at pair {} failed: {e}",
+                model.display(),
+                batch_specs[0].0
+            )
+        })?;
+
+        for ((pair_id, image0, image1), match_output) in batch_specs.iter().zip(matches) {
+            let count = match_output.confidence.len();
+            counts.push(count);
+            rows.push((*pair_id, image0.clone(), image1.clone(), count));
+        }
+
+        offset = upper;
     }
 
-    if let Some(path) = args.output_csv {
-        fs::write(path, csv_lines.join("\n") + "\n").map_err(|e| e.to_string())?;
+    if counts.is_empty() {
+        return Err(format!(
+            "model {} produced no evaluated pairs",
+            model.display()
+        ));
     }
 
     let mut sorted = counts.clone();
@@ -144,12 +272,17 @@ fn main() -> Result<(), String> {
     let p50 = percentile(&sorted, 0.50);
     let p90 = percentile(&sorted, 0.90);
 
-    println!("pairs: {}", counts.len());
-    println!("mean matches: {:.2}", mean);
-    println!("min/max: {}/{}", min, max);
-    println!("p10/p50/p90: {}/{}/{}", p10, p50, p90);
-
-    Ok(())
+    Ok(EvalSummary {
+        counts,
+        rows,
+        mean,
+        min,
+        max,
+        p10,
+        p50,
+        p90,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
 }
 
 fn collect_frame_paths(
@@ -182,4 +315,8 @@ fn percentile(sorted: &[usize], q: f64) -> usize {
     let qq = q.clamp(0.0, 1.0);
     let idx = (qq * ((sorted.len() - 1) as f64)).round() as usize;
     sorted[idx]
+}
+
+fn csv_escape(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "'"))
 }

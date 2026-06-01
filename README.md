@@ -37,6 +37,8 @@ Current scope:
 
 - Native Rust library API for running ONNX inference on image pairs
 - CLI for quick matching experiments
+- Batched matcher API for ONNX exports that accept `NCHW` inputs with `batch > 1`
+- Video/frame evaluator that can batch pair inference and compare multiple model files in one run
 - Automatic fallback for common ONNX tensor names used by LoFTR/EfficientLoFTR exports (for example `mkpts0_f`, `mkpts1_f`, `mconf`)
 - Flexible manual tensor-name overrides when a model uses custom names
 
@@ -175,9 +177,55 @@ cargo run --release --bin eval_video_frames -- \
   --output-csv outputs/scannet756_matches_20_max4096.csv
 ```
 
+If your ONNX export supports batched inputs, you can increase evaluator throughput with `--batch-size`:
+
+```bash
+cargo run --release --bin eval_video_frames -- \
+  --model /path/to/batched_model.onnx \
+  --frames-dir samples/videos/scene0756_frames \
+  --batch-size 4 \
+  --summary-csv outputs/batched_eval_summary.csv
+```
+
+You can also compare multiple models in one pass, including quantized variants:
+
+```bash
+cargo run --release --bin eval_video_frames -- \
+  --model samples/eloftr_640x480.onnx \
+  --model outputs/quantized/eloftr_640x480.fp16.onnx \
+  --model outputs/quantized/eloftr_640x480.dynamic-qint8.onnx \
+  --model outputs/quantized/eloftr_640x480.dynamic-quint8.onnx \
+  --frames-dir samples/videos/scene0756_frames \
+  --max-pairs 20 \
+  --max-matches 4096 \
+  --summary-csv outputs/quantized/eval_summary.csv \
+  --output-csv outputs/quantized/eval_pairs.csv
+```
+
+## Quantization sweep
+
+Generate quantized variants with the helper script:
+
+```bash
+/path/to/python3 scripts/quantize_models.py \
+  --input samples/eloftr_640x480.onnx \
+  --output-dir outputs/quantized \
+  --manifest outputs/quantized/manifest.json
+```
+
+Current findings for the validated `eloftr_640x480.onnx` sample export:
+
+- The code now supports batched inference, but this particular model is exported with a fixed batch dimension of `1`, so `--batch-size > 1` fails at model input validation.
+- The generated `fp16` model reduces size from `70,901,145` bytes to `36,213,294` bytes, but ONNX Runtime rejects it at load time because one cast output is typed as `tensor(float16)` where the graph still expects `tensor(float)`.
+- The generated dynamic `qint8` and `quint8` models reduce size to about `41.9 MB`, but both fail on the first evaluation batch in fine matching with a reshape error involving an empty `{0,64,64}` tensor.
+- The baseline float32 sample model remains valid on the 20-pair ScanNet subset and produced `3627.30` mean matches with `752/4096` min/max in this repo's current evaluator.
+
+See `docs/quantization-report.md` for the recorded sweep results and the exact commands used. The generated ONNX variants and CSV outputs are written under `outputs/quantized/` during local runs.
+
 ## Known limitations
 
 - Different ONNX exports may use non-standard tensor names or different preprocessing assumptions.
+- Batched inference requires a model export whose input and output tensors preserve a batch dimension; the current sample model is fixed to batch `1`.
 - Very high-quality adjacent video frames may saturate `--max-matches`; increase the cap when evaluating recall behavior.
 - This project currently focuses on inference and match extraction, not full geometric verification (RANSAC/homography/pose).
 
