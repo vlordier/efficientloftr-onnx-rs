@@ -135,8 +135,8 @@ cargo run --release --bin render_demo -- \
   --output docs/images/efficientloftr-onnx-rs-demo.png \
   --model-width 640 \
   --model-height 480 \
-  --viz-width 640 \
-  --viz-height 480 \
+  --viz-width 1088 \
+  --viz-height 812 \
   --top-k 1500 \
   --max-matches 4096
 ```
