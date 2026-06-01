@@ -2,6 +2,22 @@
 
 Rust ONNX Runtime wrapper for EfficientLoFTR-style semi-dense matching.
 
+## Demo
+
+<table>
+  <tr>
+    <td align="center"><strong>Kornia reference</strong></td>
+    <td align="center"><strong><code>efficientloftr-onnx-rs</code> generated</strong></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/kornia-matching-loftr.jpg" alt="Original Kornia LoFTR image matching demo" width="100%" /></td>
+    <td><img src="docs/images/efficientloftr-onnx-rs-demo.png" alt="Rust ONNX generated EfficientLoFTR image matching demo" width="100%" /></td>
+  </tr>
+</table>
+
+The left image is the Kornia LoFTR reference demo. The right image is generated in this repository using the same
+`kn_church-2.jpg` and `kn_church-8.jpg` pair used by the Kornia/LoFTR tutorials.
+
 ## Status
 
 This repository is working end to end for ONNX inference in Rust.
@@ -101,6 +117,25 @@ cargo run --release -- \
   --image0 samples/kn_church-2-640x480.jpg \
   --image1 samples/kn_church-8-640x480.jpg \
   --output-json samples/matches.json
+```
+
+Generate the repository demo image from the same pair:
+
+```bash
+mkdir -p docs/images
+
+# Optional: copy the Kornia reference panel used in loftr-rs docs
+cp /path/to/loftr-rs/docs/images/kornia-matching-loftr.jpg docs/images/kornia-matching-loftr.jpg
+
+cargo run --release --bin render_demo -- \
+  --model samples/eloftr_640x480.onnx \
+  --image0 samples/kn_church-2.jpg \
+  --image1 samples/kn_church-8.jpg \
+  --output docs/images/efficientloftr-onnx-rs-demo.png \
+  --width 640 \
+  --height 480 \
+  --top-k 1500 \
+  --max-matches 4096
 ```
 
 ## ScanNet video-style evaluation (LoFTR project clip)
