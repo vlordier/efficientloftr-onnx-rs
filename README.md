@@ -81,6 +81,13 @@ cargo run --release -- \
   --output-json /tmp/matches.json
 ```
 
+Inspect model IO metadata and batch support before running batched evaluation:
+
+```bash
+cargo run --release --bin inspect_model -- \
+  --model samples/eloftr_640x480.onnx
+```
+
 Quick smoke test:
 
 ```bash
@@ -186,6 +193,8 @@ cargo run --release --bin eval_video_frames -- \
   --batch-size 4 \
   --summary-csv outputs/batched_eval_summary.csv
 ```
+
+Use `inspect_model` first to verify that the first input dimension is dynamic (`-1`) rather than fixed to `1`.
 
 You can also compare multiple models in one pass, including quantized variants:
 
