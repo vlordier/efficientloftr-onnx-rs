@@ -196,6 +196,8 @@ cargo run --release --bin eval_video_frames -- \
 ```
 
 Use `inspect_model` first to verify that the first input dimension is dynamic (`-1`) rather than fixed to `1`.
+If you request a larger batch for a fixed-batch-1 model, the evaluator now falls back to effective batch size `1`
+and reports both requested/effective batch sizes.
 
 You can also compare multiple models in one pass, including quantized variants:
 
@@ -231,11 +233,18 @@ Generate quantized variants with the helper script:
   --manifest outputs/quantized/manifest.json
 ```
 
+Default generation now uses conservative dynamic quantization modes that are runnable for the validated sample model:
+
+- `dynamic-qint8-matmul`
+- `dynamic-quint8-matmul`
+
+Optional experimental modes (`fp16-safe`, `fp16-full`, `dynamic-*-full`) are available via `--mode` but may fail depending on export details.
+
 Current findings for the validated `eloftr_640x480.onnx` sample export:
 
 - The code now supports batched inference, but this particular model is exported with a fixed batch dimension of `1`, so `--batch-size > 1` fails at model input validation.
-- The generated `fp16` model reduces size from `70,901,145` bytes to `36,213,294` bytes, but ONNX Runtime rejects it at load time because one cast output is typed as `tensor(float16)` where the graph still expects `tensor(float)`.
-- The generated dynamic `qint8` and `quint8` models reduce size to about `41.9 MB`, but both fail on the first evaluation batch in fine matching with a reshape error involving an empty `{0,64,64}` tensor.
+- Experimental fp16 conversion is still export-dependent and currently fails on this sample with float16/float type binding mismatches in coarse attention nodes.
+- Full dynamic quantization can still fail for this model export; matmul-only dynamic quantization is the default because it executes successfully.
 - The baseline float32 sample model remains valid on the 20-pair ScanNet subset and produced `3627.30` mean matches with `752/4096` min/max in this repo's current evaluator.
 
 See `docs/quantization-report.md` for the recorded sweep results and the exact commands used. The generated ONNX variants and CSV outputs are written under `outputs/quantized/` during local runs.

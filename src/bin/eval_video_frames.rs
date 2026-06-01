@@ -6,6 +6,8 @@ use clap::Parser;
 use efficientloftr_onnx_rs::{
     EfficientLoftrConfig, EfficientLoftrMatcher, GrayscaleFrame, MatchDiagnostics,
 };
+use ort::session::{Session, builder::GraphOptimizationLevel};
+use ort::value::ValueType;
 
 #[derive(Parser, Debug)]
 #[command(name = "eval-video-frames")]
@@ -98,7 +100,7 @@ fn main() -> Result<(), String> {
         "model,pair,image0,image1,match_count,raw_keypoints0_count,raw_keypoints1_count,candidate_count,kept_ratio,raw_conf_mean,raw_conf_p50,raw_conf_p90,batch_latency_ms,per_pair_latency_ms".to_string(),
     ];
     let mut summary_csv_lines = vec![
-        "model,status,pairs,mean_matches,min_matches,max_matches,p10,p50,p90,batch_size,elapsed_ms,mean_pair_latency_ms,p50_pair_latency_ms,pairs_per_sec,mean_raw_keypoints0,mean_raw_keypoints1,mean_candidate_count,mean_kept_ratio,mean_raw_conf_mean,p50_raw_conf_mean,p90_raw_conf_mean,error".to_string(),
+        "model,status,pairs,mean_matches,min_matches,max_matches,p10,p50,p90,requested_batch_size,effective_batch_size,elapsed_ms,mean_pair_latency_ms,p50_pair_latency_ms,pairs_per_sec,mean_raw_keypoints0,mean_raw_keypoints1,mean_candidate_count,mean_kept_ratio,mean_raw_conf_mean,p50_raw_conf_mean,p90_raw_conf_mean,error".to_string(),
     ];
 
     for model in &args.model {
@@ -123,29 +125,34 @@ fn main() -> Result<(), String> {
                         row.pair_latency_ms
                     ));
                 }
-                summary_csv_lines.push(format!(
-                    "{},ok,{},{:.2},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.2},{:.2},{:.2},{:.6},{:.6},{:.6},{:.6},",
-                    model.display(),
-                    summary.counts.len(),
-                    summary.mean,
-                    summary.min,
-                    summary.max,
-                    summary.p10,
-                    summary.p50,
-                    summary.p90,
-                    args.batch_size,
-                    summary.elapsed_ms,
-                    summary.mean_pair_latency_ms,
-                    summary.p50_pair_latency_ms,
-                    summary.pairs_per_sec,
-                    summary.mean_raw_keypoints0,
-                    summary.mean_raw_keypoints1,
-                    summary.mean_candidate_count,
-                    summary.mean_kept_ratio,
-                    summary.mean_raw_conf_mean,
-                    summary.p50_raw_conf_mean,
-                    summary.p90_raw_conf_mean
-                ));
+                summary_csv_lines.push(
+                    vec![
+                        model.display().to_string(),
+                        "ok".to_string(),
+                        summary.counts.len().to_string(),
+                        format!("{:.2}", summary.mean),
+                        summary.min.to_string(),
+                        summary.max.to_string(),
+                        summary.p10.to_string(),
+                        summary.p50.to_string(),
+                        summary.p90.to_string(),
+                        summary.requested_batch_size.to_string(),
+                        summary.effective_batch_size.to_string(),
+                        summary.elapsed_ms.to_string(),
+                        format!("{:.3}", summary.mean_pair_latency_ms),
+                        format!("{:.3}", summary.p50_pair_latency_ms),
+                        format!("{:.3}", summary.pairs_per_sec),
+                        format!("{:.2}", summary.mean_raw_keypoints0),
+                        format!("{:.2}", summary.mean_raw_keypoints1),
+                        format!("{:.2}", summary.mean_candidate_count),
+                        format!("{:.6}", summary.mean_kept_ratio),
+                        format!("{:.6}", summary.mean_raw_conf_mean),
+                        format!("{:.6}", summary.p50_raw_conf_mean),
+                        format!("{:.6}", summary.p90_raw_conf_mean),
+                        String::new(),
+                    ]
+                    .join(","),
+                );
 
                 println!("model: {}", model.display());
                 println!("status: ok");
@@ -155,6 +162,10 @@ fn main() -> Result<(), String> {
                 println!(
                     "p10/p50/p90: {}/{}/{}",
                     summary.p10, summary.p50, summary.p90
+                );
+                println!(
+                    "requested/effective batch size: {}/{}",
+                    summary.requested_batch_size, summary.effective_batch_size
                 );
                 println!("elapsed ms: {}", summary.elapsed_ms);
                 println!(
@@ -181,7 +192,7 @@ fn main() -> Result<(), String> {
                     return Err(error);
                 }
                 let mut fields = vec![model.display().to_string(), "error".to_string()];
-                for _ in 0..19 {
+                for _ in 0..20 {
                     fields.push(String::new());
                 }
                 fields.push(csv_escape(&error));
@@ -224,6 +235,8 @@ struct EvalSummary {
     mean_raw_conf_mean: f64,
     p50_raw_conf_mean: f64,
     p90_raw_conf_mean: f64,
+    requested_batch_size: usize,
+    effective_batch_size: usize,
 }
 
 struct PairMetricsRow {
@@ -267,6 +280,7 @@ fn evaluate_model(
     pair_specs: &[(usize, PathBuf, PathBuf)],
     batch_size: usize,
 ) -> Result<EvalSummary, String> {
+    let effective_batch_size = resolve_effective_batch_size(model, batch_size)?;
     let mut matcher =
         EfficientLoftrMatcher::from_model_path(model, config.clone()).map_err(|e| e.to_string())?;
     let started = std::time::Instant::now();
@@ -281,7 +295,7 @@ fn evaluate_model(
 
     let mut offset = 0usize;
     while offset < pair_specs.len() {
-        let upper = cmp::min(offset + batch_size, pair_specs.len());
+        let upper = cmp::min(offset + effective_batch_size, pair_specs.len());
         let batch_specs = &pair_specs[offset..upper];
 
         let mut frames0 = Vec::with_capacity(batch_specs.len());
@@ -402,7 +416,73 @@ fn evaluate_model(
         mean_raw_conf_mean,
         p50_raw_conf_mean,
         p90_raw_conf_mean,
+        requested_batch_size: batch_size,
+        effective_batch_size,
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BatchSupport {
+    Dynamic,
+    Fixed(usize),
+    Unknown,
+}
+
+fn resolve_effective_batch_size(
+    model: &Path,
+    requested_batch_size: usize,
+) -> Result<usize, String> {
+    let support = detect_batch_support(model)?;
+    match support {
+        BatchSupport::Dynamic | BatchSupport::Unknown => Ok(requested_batch_size),
+        BatchSupport::Fixed(1) => Ok(1),
+        BatchSupport::Fixed(expected) if requested_batch_size == expected => Ok(expected),
+        BatchSupport::Fixed(expected) => Err(format!(
+            "model {} requires fixed batch size {}, but requested {}",
+            model.display(),
+            expected,
+            requested_batch_size
+        )),
+    }
+}
+
+fn detect_batch_support(model: &Path) -> Result<BatchSupport, String> {
+    let session = Session::builder()
+        .map_err(|e| e.to_string())?
+        .with_optimization_level(GraphOptimizationLevel::Level3)
+        .map_err(|e| e.to_string())?
+        .commit_from_file(model)
+        .map_err(|e| e.to_string())?;
+
+    let mut saw_tensor = false;
+    let mut fixed_dim: Option<usize> = None;
+    for input in session.inputs() {
+        if let ValueType::Tensor { shape, .. } = input.dtype() {
+            saw_tensor = true;
+            match shape.first().copied() {
+                Some(-1) => return Ok(BatchSupport::Dynamic),
+                Some(v) if v > 0 => {
+                    let current = v as usize;
+                    if let Some(existing) = fixed_dim {
+                        if existing != current {
+                            return Ok(BatchSupport::Unknown);
+                        }
+                    } else {
+                        fixed_dim = Some(current);
+                    }
+                }
+                _ => return Ok(BatchSupport::Unknown),
+            }
+        }
+    }
+
+    if !saw_tensor {
+        return Ok(BatchSupport::Unknown);
+    }
+
+    Ok(fixed_dim
+        .map(BatchSupport::Fixed)
+        .unwrap_or(BatchSupport::Unknown))
 }
 
 fn collect_frame_paths(

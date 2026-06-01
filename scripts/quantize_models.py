@@ -19,8 +19,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         action="append",
-        choices=["fp16", "dynamic-qint8", "dynamic-quint8"],
-        help="Quantization mode to generate (repeatable). Defaults to all modes.",
+        choices=[
+            "fp16-safe",
+            "fp16-full",
+            "dynamic-qint8-matmul",
+            "dynamic-quint8-matmul",
+            "dynamic-qint8-full",
+            "dynamic-quint8-full",
+        ],
+        help="Quantization mode to generate (repeatable). Defaults to safer runnable modes.",
     )
     parser.add_argument(
         "--manifest",
@@ -42,7 +49,7 @@ def main() -> int:
             "missing Python dependencies; install onnx, onnxruntime, and onnxconverter-common"
         ) from exc
 
-    modes = args.mode or ["fp16", "dynamic-qint8", "dynamic-quint8"]
+    modes = args.mode or ["dynamic-qint8-matmul", "dynamic-quint8-matmul"]
     input_path = args.input.resolve()
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -51,21 +58,40 @@ def main() -> int:
     stem = input_path.stem
 
     for mode in modes:
-        if mode == "fp16":
-            output_path = output_dir / f"{stem}.fp16.onnx"
+        output_path = output_dir / f"{stem}.{mode}.onnx"
+        print(f"running {mode}...")
+        if mode == "fp16-safe":
+            source = onnx.load(str(input_path))
+            model = float16.convert_float_to_float16(
+                source,
+                keep_io_types=True,
+                op_block_list=["Cast"],
+                disable_shape_infer=True,
+            )
+            onnx.save(model, str(output_path))
+        elif mode == "fp16-full":
             model = float16.convert_float_to_float16_model_path(
                 str(input_path),
                 keep_io_types=True,
             )
             onnx.save(model, str(output_path))
         else:
-            output_path = output_dir / f"{stem}.{mode}.onnx"
-            weight_type = QuantType.QInt8 if mode == "dynamic-qint8" else QuantType.QUInt8
+            if mode in {"dynamic-qint8-matmul", "dynamic-qint8-full"}:
+                weight_type = QuantType.QInt8
+            else:
+                weight_type = QuantType.QUInt8
+
+            if mode.endswith("-matmul"):
+                op_types_to_quantize = ["MatMul", "Gemm"]
+            else:
+                op_types_to_quantize = None
+
             quantize_dynamic(
                 str(input_path),
                 str(output_path),
                 weight_type=weight_type,
                 per_channel=True,
+                op_types_to_quantize=op_types_to_quantize,
                 extra_options={"MatMulConstBOnly": True},
             )
 
