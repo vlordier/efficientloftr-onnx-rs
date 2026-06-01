@@ -95,25 +95,17 @@ def _patch_loftr_forward_for_export(matcher: nn.Module) -> None:
             }
         )
 
-        if data["hw0_i"] == data["hw1_i"]:
-            ret_dict = self.backbone(torch.cat([data["image0"], data["image1"]], dim=0))
-            feats_c = ret_dict["feats_c"]
-            data.update({"feats_x2": ret_dict["feats_x2"], "feats_x1": ret_dict["feats_x1"]})
-            bs = data["bs"]
-            feat_c0 = feats_c[:bs]
-            feat_c1 = feats_c[bs:]
-        else:
-            ret_dict0, ret_dict1 = self.backbone(data["image0"]), self.backbone(data["image1"])
-            feat_c0 = ret_dict0["feats_c"]
-            feat_c1 = ret_dict1["feats_c"]
-            data.update(
-                {
-                    "feats_x2_0": ret_dict0["feats_x2"],
-                    "feats_x1_0": ret_dict0["feats_x1"],
-                    "feats_x2_1": ret_dict1["feats_x2"],
-                    "feats_x1_1": ret_dict1["feats_x1"],
-                }
-            )
+        ret_dict0, ret_dict1 = self.backbone(data["image0"]), self.backbone(data["image1"])
+        feat_c0 = ret_dict0["feats_c"]
+        feat_c1 = ret_dict1["feats_c"]
+        data.update(
+            {
+                "feats_x2_0": ret_dict0["feats_x2"],
+                "feats_x1_0": ret_dict0["feats_x1"],
+                "feats_x2_1": ret_dict1["feats_x2"],
+                "feats_x1_1": ret_dict1["feats_x1"],
+            }
+        )
 
         mul = self.config["resolution"][0] // self.config["resolution"][1]
         data.update(
@@ -187,11 +179,27 @@ def _patch_coarse_matching_for_export(matcher: nn.Module) -> None:
             conf_matrix == conf_matrix.max(dim=1, keepdim=True)[0]
         )
 
-        mask_int = mask.to(torch.int64)
-        mask_v, all_j_ids = mask_int.max(dim=2)
-        b_ids, i_ids = torch.where(mask_v > 0)
-        j_ids = all_j_ids[b_ids, i_ids]
-        mconf = conf_matrix[b_ids, i_ids, j_ids]
+        mask_conf = conf_matrix * mask.to(conf_matrix.dtype)
+        mconf_per_row, j_ids_per_row = torch.topk(mask_conf, k=1, dim=2)
+        mconf_per_row = mconf_per_row.squeeze(2)
+        j_ids_per_row = j_ids_per_row.squeeze(2)
+
+        batch_size = mask.shape[0]
+        row_count = mask.shape[1]
+        b_ids = (
+            torch.arange(batch_size, device=_device, dtype=torch.long)
+            .unsqueeze(1)
+            .expand(batch_size, row_count)
+            .reshape(-1)
+        )
+        i_ids = (
+            torch.arange(row_count, device=_device, dtype=torch.long)
+            .unsqueeze(0)
+            .expand(batch_size, row_count)
+            .reshape(-1)
+        )
+        j_ids = j_ids_per_row.reshape(-1)
+        mconf = mconf_per_row.reshape(-1)
 
         if self.training:
             if "mask0" not in data:
@@ -243,13 +251,15 @@ def _patch_coarse_matching_for_export(matcher: nn.Module) -> None:
             dim=1,
         ) * scale1
 
-        m_bids = b_ids[mconf != 0]
+        valid = mconf > 0
+        invalid_conf = torch.full_like(mconf, -1e9)
+        mconf = torch.where(valid, mconf, invalid_conf)
         coarse_matches.update(
             {
-                "m_bids": m_bids,
-                "mkpts0_c": mkpts0_c[mconf != 0],
-                "mkpts1_c": mkpts1_c[mconf != 0],
-                "mconf": mconf[mconf != 0],
+                "m_bids": b_ids,
+                "mkpts0_c": mkpts0_c,
+                "mkpts1_c": mkpts1_c,
+                "mconf": mconf,
             }
         )
 
@@ -271,40 +281,6 @@ def _patch_fine_preprocess_for_export(matcher: nn.Module) -> None:
 
         data.update({"W": w})
 
-        if data["hw0_i"] == data["hw1_i"]:
-            feat_c = rearrange(
-                torch.cat([feat_c0, feat_c1], 0),
-                "b (h w) c -> b c h w",
-                h=data["hw0_c"][0],
-            )
-            x2 = data["feats_x2"]
-            x1 = data["feats_x1"]
-            del data["feats_x2"], data["feats_x1"]
-
-            x1 = self.inter_fpn(feat_c, x2, x1, stride)
-            bs = data["bs"]
-            feat_f0 = x1[:bs]
-            feat_f1 = x1[bs:]
-
-            feat_f0 = F.unfold(feat_f0, kernel_size=(w, w), stride=stride, padding=0)
-            feat_f0 = rearrange(feat_f0, "n (c ww) l -> n l ww c", ww=w**2)
-            feat_f1 = F.unfold(feat_f1, kernel_size=(w + 2, w + 2), stride=stride, padding=1)
-            feat_f1 = rearrange(feat_f1, "n (c ww) l -> n l ww c", ww=(w + 2) ** 2)
-
-            feat_f0 = feat_f0.reshape(-1, feat_f0.shape[2], feat_f0.shape[3])
-            feat_f1 = feat_f1.reshape(-1, feat_f1.shape[2], feat_f1.shape[3])
-            feat_f0 = torch.index_select(
-                feat_f0,
-                0,
-                (data["b_ids"] * data["hw0_c"][1] + data["i_ids"]).to(torch.long),
-            )
-            feat_f1 = torch.index_select(
-                feat_f1,
-                0,
-                (data["b_ids"] * data["hw1_c"][1] + data["j_ids"]).to(torch.long),
-            )
-            return feat_f0, feat_f1
-
         feat_c0 = rearrange(feat_c0, "b (h w) c -> b c h w", h=data["hw0_c"][0])
         feat_c1 = rearrange(feat_c1, "b (h w) c -> b c h w", h=data["hw1_c"][0])
         x2_0, x2_1 = data["feats_x2_0"], data["feats_x2_1"]
@@ -321,16 +297,16 @@ def _patch_fine_preprocess_for_export(matcher: nn.Module) -> None:
 
         feat_f0 = feat_f0.reshape(-1, feat_f0.shape[2], feat_f0.shape[3])
         feat_f1 = feat_f1.reshape(-1, feat_f1.shape[2], feat_f1.shape[3])
-        feat_f0 = torch.index_select(
-            feat_f0,
-            0,
-            (data["b_ids"] * data["hw0_c"][1] + data["i_ids"]).to(torch.long),
-        )
-        feat_f1 = torch.index_select(
-            feat_f1,
-            0,
-            (data["b_ids"] * data["hw1_c"][1] + data["j_ids"]).to(torch.long),
-        )
+
+        # Explicit gather keeps rank information explicit and avoids fragile
+        # 3D `index_select` lowering patterns that can crash NCNN in post-processing.
+        idx0 = (data["b_ids"] * data["hw0_c"][1] + data["i_ids"]).to(torch.long)
+        idx0 = idx0.reshape(-1, 1, 1).expand(-1, feat_f0.shape[1], feat_f0.shape[2])
+        feat_f0 = torch.gather(feat_f0, dim=0, index=idx0)
+
+        idx1 = (data["b_ids"] * data["hw1_c"][1] + data["j_ids"]).to(torch.long)
+        idx1 = idx1.reshape(-1, 1, 1).expand(-1, feat_f1.shape[1], feat_f1.shape[2])
+        feat_f1 = torch.gather(feat_f1, dim=0, index=idx1)
         return feat_f0, feat_f1
 
     fine.forward = types.MethodType(export_friendly_forward, fine)
@@ -365,8 +341,8 @@ def _patch_fine_matching_for_export(matcher: nn.Module, export_safe: bool = Fals
         softmax_matrix_f = softmax_matrix_f[..., 1:-1, 1:-1].reshape(m, self.WW, self.WW)
 
         conf_flat = softmax_matrix_f.reshape(m, ww * ww)
-        mconf, idx = torch.max(conf_flat, dim=-1)
-        idx = idx.unsqueeze(-1)
+        mconf, idx = torch.topk(conf_flat, k=1, dim=-1, largest=True, sorted=True)
+        mconf = mconf.squeeze(-1)
         idx_l = idx // ww
         idx_r = idx % ww
 
