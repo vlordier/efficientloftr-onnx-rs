@@ -258,6 +258,61 @@ See `docs/quantization-report.md` for the recorded sweep results and the exact c
 
 For a Rust-specific reproduction flow modeled after the upstream `scripts/reproduce_test/*_auc.sh` scripts, see [docs/rust-reproduction.md](docs/rust-reproduction.md).
 
+## Upstream PyTorch export and Apple benchmark prototype
+
+This repository now includes experimental scripts for working directly from the original upstream EfficientLoFTR PyTorch checkpoint:
+
+- `scripts/export_dynamic_efficientloftr_onnx.py`: attempts dynamic-batch ONNX export from upstream model code.
+- `scripts/benchmark_torch_mps.py`: benchmarks native PyTorch execution on Apple Silicon (`mps`) or CPU.
+- `scripts/upstream_efficientloftr.py`: shared upstream loader and output wrapper utilities.
+
+### Prepare upstream assets
+
+```bash
+mkdir -p third_party
+git clone --depth 1 https://github.com/zju3dv/EfficientLoFTR.git third_party/EfficientLoFTR
+
+/path/to/python -m pip install einops kornia loguru yacs joblib pytorch-lightning onnxscript gdown
+/path/to/python -m gdown --folder \
+  https://drive.google.com/drive/folders/1GOw6iVqsB-f1vmG6rNmdCcgwfB4VZ7_Q \
+  --output third_party/weights
+```
+
+### Attempt dynamic-batch ONNX export from upstream
+
+```bash
+/path/to/python scripts/export_dynamic_efficientloftr_onnx.py \
+  --output outputs/dynamic/eloftr_640x480.true-dynamic.onnx \
+  --height 480 \
+  --width 640 \
+  --example-batch 2 \
+  --max-batch 8 \
+  --max-matches 4096
+```
+
+The exporter is implemented and wired to upstream model loading, but current `torch.export` still hits data-dependent guards in upstream fine-matching internals on this setup. Logs from local attempts are captured under `/tmp/eloftr_export_dynamo.log` during debugging.
+
+### Benchmark native PyTorch on Apple Silicon
+
+```bash
+/path/to/python scripts/benchmark_torch_mps.py \
+  --frames-dir samples/videos/scene0756_frames \
+  --max-pairs 8 \
+  --max-matches 4096 \
+  --batch-size 4 \
+  --max-batch 8 \
+  --output-csv outputs/dynamic/torch_mps_pairs.csv \
+  --summary-csv outputs/dynamic/torch_mps_summary.csv
+```
+
+Local prototype comparison artifacts against Rust ONNX baseline are written to:
+
+- `outputs/dynamic/onnx_baseline_batch1_summary.csv`
+- `outputs/dynamic/onnx_baseline_batch4req_summary.csv`
+- `outputs/dynamic/torch_mps_summary.csv`
+- `outputs/dynamic/apple_backend_compare.csv`
+- `outputs/dynamic/apple_backend_compare.md`
+
 ## Known limitations
 
 - Different ONNX exports may use non-standard tensor names or different preprocessing assumptions.

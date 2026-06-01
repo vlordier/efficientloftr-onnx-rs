@@ -5,5 +5,6 @@
 /outputs/quantized_repair/eloftr_640x480.dynamic-quint8-full.compat.onnx
 /outputs/quantized_repair/eloftr_640x480.fp16-safe.compat.onnx
 /outputs/quantized_repair/eloftr_640x480.fp16-full.compat.onnx
+/third_party
 __pycache__/
 *.pyc
