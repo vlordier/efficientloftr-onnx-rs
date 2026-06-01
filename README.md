@@ -171,7 +171,8 @@ cargo run --release --bin eval_video_frames -- \
   --output-csv outputs/scannet756_matches.csv
 ```
 
-This writes per-pair counts to `outputs/scannet756_matches.csv` and prints summary statistics (mean/min/max/p10/p50/p90).
+This writes per-pair counts to `outputs/scannet756_matches.csv` and prints summary statistics
+(mean/min/max/p10/p50/p90 plus latency and pairs/sec).
 
 Example short run with uncapped output checks:
 
@@ -210,6 +211,9 @@ cargo run --release --bin eval_video_frames -- \
   --summary-csv outputs/quantized/eval_summary.csv \
   --output-csv outputs/quantized/eval_pairs.csv
 ```
+
+`eval_pairs.csv` includes per-pair latency columns (`batch_latency_ms`, `per_pair_latency_ms`) and
+`eval_summary.csv` includes aggregate speed metrics (`mean_pair_latency_ms`, `p50_pair_latency_ms`, `pairs_per_sec`).
 
 ## Quantization sweep
 

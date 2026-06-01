@@ -92,27 +92,32 @@ fn main() -> Result<(), String> {
         return Err("no frame pairs were evaluated".to_string());
     }
 
-    let mut pair_csv_lines = vec!["model,pair,image0,image1,match_count".to_string()];
+    let mut pair_csv_lines = vec![
+        "model,pair,image0,image1,match_count,batch_latency_ms,per_pair_latency_ms".to_string(),
+    ];
     let mut summary_csv_lines = vec![
-        "model,status,pairs,mean_matches,min_matches,max_matches,p10,p50,p90,batch_size,elapsed_ms,error"
-            .to_string(),
+        "model,status,pairs,mean_matches,min_matches,max_matches,p10,p50,p90,batch_size,elapsed_ms,mean_pair_latency_ms,p50_pair_latency_ms,pairs_per_sec,error".to_string(),
     ];
 
     for model in &args.model {
         match evaluate_model(model, &config, &pair_specs, args.batch_size) {
             Ok(summary) => {
-                for (pair_id, image0, image1, count) in &summary.rows {
+                for (pair_id, image0, image1, count, batch_latency_ms, pair_latency_ms) in
+                    &summary.rows
+                {
                     pair_csv_lines.push(format!(
-                        "{},{},{},{},{}",
+                        "{},{},{},{},{},{:.3},{:.3}",
                         model.display(),
                         pair_id,
                         image0.display(),
                         image1.display(),
-                        count
+                        count,
+                        batch_latency_ms,
+                        pair_latency_ms
                     ));
                 }
                 summary_csv_lines.push(format!(
-                    "{},ok,{},{:.2},{},{},{},{},{},{},{},",
+                    "{},ok,{},{:.2},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},",
                     model.display(),
                     summary.counts.len(),
                     summary.mean,
@@ -122,7 +127,10 @@ fn main() -> Result<(), String> {
                     summary.p50,
                     summary.p90,
                     args.batch_size,
-                    summary.elapsed_ms
+                    summary.elapsed_ms,
+                    summary.mean_pair_latency_ms,
+                    summary.p50_pair_latency_ms,
+                    summary.pairs_per_sec
                 ));
 
                 println!("model: {}", model.display());
@@ -135,16 +143,22 @@ fn main() -> Result<(), String> {
                     summary.p10, summary.p50, summary.p90
                 );
                 println!("elapsed ms: {}", summary.elapsed_ms);
+                println!(
+                    "mean/p50 pair latency ms: {:.3}/{:.3}",
+                    summary.mean_pair_latency_ms, summary.p50_pair_latency_ms
+                );
+                println!("pairs/sec: {:.3}", summary.pairs_per_sec);
             }
             Err(error) => {
                 if args.model.len() == 1 {
                     return Err(error);
                 }
-                summary_csv_lines.push(format!(
-                    "{},error,,,,,,,,,,{}",
-                    model.display(),
-                    csv_escape(&error)
-                ));
+                let mut fields = vec![model.display().to_string(), "error".to_string()];
+                for _ in 0..12 {
+                    fields.push(String::new());
+                }
+                fields.push(csv_escape(&error));
+                summary_csv_lines.push(fields.join(","));
                 println!("model: {}", model.display());
                 println!("status: error");
                 println!("error: {}", error);
@@ -165,7 +179,7 @@ fn main() -> Result<(), String> {
 
 struct EvalSummary {
     counts: Vec<usize>,
-    rows: Vec<(usize, PathBuf, PathBuf, usize)>,
+    rows: Vec<(usize, PathBuf, PathBuf, usize, f64, f64)>,
     mean: f64,
     min: usize,
     max: usize,
@@ -173,6 +187,9 @@ struct EvalSummary {
     p50: usize,
     p90: usize,
     elapsed_ms: u128,
+    mean_pair_latency_ms: f64,
+    p50_pair_latency_ms: f64,
+    pairs_per_sec: f64,
 }
 
 fn collect_pair_specs(
@@ -211,6 +228,7 @@ fn evaluate_model(
     let started = std::time::Instant::now();
     let mut rows = Vec::with_capacity(pair_specs.len());
     let mut counts = Vec::with_capacity(pair_specs.len());
+    let mut pair_latency_ms = Vec::with_capacity(pair_specs.len());
 
     let mut offset = 0usize;
     while offset < pair_specs.len() {
@@ -239,6 +257,7 @@ fn evaluate_model(
 
         let batch0: Vec<&GrayscaleFrame> = frames0.iter().collect();
         let batch1: Vec<&GrayscaleFrame> = frames1.iter().collect();
+        let batch_started = std::time::Instant::now();
         let matches = matcher.match_batch(&batch0, &batch1).map_err(|e| {
             format!(
                 "model {} batch starting at pair {} failed: {e}",
@@ -246,11 +265,21 @@ fn evaluate_model(
                 batch_specs[0].0
             )
         })?;
+        let batch_latency_ms = batch_started.elapsed().as_secs_f64() * 1000.0;
+        let per_pair_latency_ms = batch_latency_ms / batch_specs.len() as f64;
 
         for ((pair_id, image0, image1), match_output) in batch_specs.iter().zip(matches) {
             let count = match_output.confidence.len();
             counts.push(count);
-            rows.push((*pair_id, image0.clone(), image1.clone(), count));
+            pair_latency_ms.push(per_pair_latency_ms);
+            rows.push((
+                *pair_id,
+                image0.clone(),
+                image1.clone(),
+                count,
+                batch_latency_ms,
+                per_pair_latency_ms,
+            ));
         }
 
         offset = upper;
@@ -271,6 +300,17 @@ fn evaluate_model(
     let p10 = percentile(&sorted, 0.10);
     let p50 = percentile(&sorted, 0.50);
     let p90 = percentile(&sorted, 0.90);
+    let mut latency_sorted = pair_latency_ms.clone();
+    latency_sorted.sort_by(|a, b| a.total_cmp(b));
+    let mean_pair_latency_ms = pair_latency_ms.iter().sum::<f64>() / pair_latency_ms.len() as f64;
+    let p50_pair_latency_ms = percentile_f64(&latency_sorted, 0.50);
+    let elapsed_ms = started.elapsed().as_millis();
+    let elapsed_s = started.elapsed().as_secs_f64();
+    let pairs_per_sec = if elapsed_s > 0.0 {
+        counts.len() as f64 / elapsed_s
+    } else {
+        0.0
+    };
 
     Ok(EvalSummary {
         counts,
@@ -281,7 +321,10 @@ fn evaluate_model(
         p10,
         p50,
         p90,
-        elapsed_ms: started.elapsed().as_millis(),
+        elapsed_ms,
+        mean_pair_latency_ms,
+        p50_pair_latency_ms,
+        pairs_per_sec,
     })
 }
 
@@ -311,6 +354,15 @@ fn collect_frame_paths(
 fn percentile(sorted: &[usize], q: f64) -> usize {
     if sorted.is_empty() {
         return 0;
+    }
+    let qq = q.clamp(0.0, 1.0);
+    let idx = (qq * ((sorted.len() - 1) as f64)).round() as usize;
+    sorted[idx]
+}
+
+fn percentile_f64(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
     }
     let qq = q.clamp(0.0, 1.0);
     let idx = (qq * ((sorted.len() - 1) as f64)).round() as usize;
