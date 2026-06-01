@@ -66,6 +66,7 @@ pub enum EfficientLoftrError {
     Io(String),
     Image(String),
     InvalidImageShape,
+    MissingInput(String),
     MissingOutput(String),
     InvalidOutputShape(String),
     Ort(String),
@@ -77,6 +78,7 @@ impl fmt::Display for EfficientLoftrError {
             Self::Io(msg) => write!(f, "io error: {msg}"),
             Self::Image(msg) => write!(f, "image decode error: {msg}"),
             Self::InvalidImageShape => write!(f, "invalid image shape or dimensions"),
+            Self::MissingInput(name) => write!(f, "missing model input: {name}"),
             Self::MissingOutput(name) => write!(f, "missing model output: {name}"),
             Self::InvalidOutputShape(name) => write!(f, "invalid output shape for: {name}"),
             Self::Ort(msg) => write!(f, "onnx runtime error: {msg}"),
@@ -123,35 +125,115 @@ impl EfficientLoftrMatcher {
         let input0 = make_nchw_tensor(image0)?;
         let input1 = make_nchw_tensor(image1)?;
 
+        let available_input_names = self
+            .session
+            .inputs()
+            .iter()
+            .map(|entry| entry.name().to_string())
+            .collect::<Vec<_>>();
+        let input0_name = resolve_name(
+            &available_input_names,
+            &self.config.input0_name,
+            &["image0", "img0", "input0", "left"],
+        )
+        .ok_or_else(|| {
+            EfficientLoftrError::MissingInput(format!(
+                "{} (available: {})",
+                self.config.input0_name,
+                available_input_names.join(", ")
+            ))
+        })?;
+        let input1_name = resolve_name(
+            &available_input_names,
+            &self.config.input1_name,
+            &["image1", "img1", "input1", "right"],
+        )
+        .ok_or_else(|| {
+            EfficientLoftrError::MissingInput(format!(
+                "{} (available: {})",
+                self.config.input1_name,
+                available_input_names.join(", ")
+            ))
+        })?;
+
+        let available_output_names = self
+            .session
+            .outputs()
+            .iter()
+            .map(|entry| entry.name().to_string())
+            .collect::<Vec<_>>();
+        let keypoints0_name = resolve_name(
+            &available_output_names,
+            &self.config.keypoints0_name,
+            &["keypoints0", "mkpts0_f", "points0", "kpts0"],
+        )
+        .ok_or_else(|| {
+            EfficientLoftrError::MissingOutput(format!(
+                "{} (available: {})",
+                self.config.keypoints0_name,
+                available_output_names.join(", ")
+            ))
+        })?;
+        let keypoints1_name = resolve_name(
+            &available_output_names,
+            &self.config.keypoints1_name,
+            &["keypoints1", "mkpts1_f", "points1", "kpts1"],
+        )
+        .ok_or_else(|| {
+            EfficientLoftrError::MissingOutput(format!(
+                "{} (available: {})",
+                self.config.keypoints1_name,
+                available_output_names.join(", ")
+            ))
+        })?;
+        let confidence_name = resolve_name(
+            &available_output_names,
+            &self.config.confidence_name,
+            &["confidence", "mconf", "scores", "conf"],
+        )
+        .ok_or_else(|| {
+            EfficientLoftrError::MissingOutput(format!(
+                "{} (available: {})",
+                self.config.confidence_name,
+                available_output_names.join(", ")
+            ))
+        })?;
+
         let mut outputs = self
             .session
             .run(ort::inputs![
-                self.config.input0_name.as_str() => input0,
-                self.config.input1_name.as_str() => input1
+                input0_name.as_str() => input0,
+                input1_name.as_str() => input1
             ])
             .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?;
 
-        let keypoints0_value = outputs
-            .remove(self.config.keypoints0_name.as_str())
-            .ok_or_else(|| {
-                EfficientLoftrError::MissingOutput(self.config.keypoints0_name.clone())
-            })?;
+        let keypoints0_value = outputs.remove(keypoints0_name.as_str()).ok_or_else(|| {
+            EfficientLoftrError::MissingOutput(format!(
+                "{} (available: {})",
+                keypoints0_name,
+                available_output_names.join(", ")
+            ))
+        })?;
         let keypoints0 = keypoints0_value
             .try_extract_array::<f32>()
             .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?;
-        let keypoints1_value = outputs
-            .remove(self.config.keypoints1_name.as_str())
-            .ok_or_else(|| {
-                EfficientLoftrError::MissingOutput(self.config.keypoints1_name.clone())
-            })?;
+        let keypoints1_value = outputs.remove(keypoints1_name.as_str()).ok_or_else(|| {
+            EfficientLoftrError::MissingOutput(format!(
+                "{} (available: {})",
+                keypoints1_name,
+                available_output_names.join(", ")
+            ))
+        })?;
         let keypoints1 = keypoints1_value
             .try_extract_array::<f32>()
             .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?;
-        let confidence_value = outputs
-            .remove(self.config.confidence_name.as_str())
-            .ok_or_else(|| {
-                EfficientLoftrError::MissingOutput(self.config.confidence_name.clone())
-            })?;
+        let confidence_value = outputs.remove(confidence_name.as_str()).ok_or_else(|| {
+            EfficientLoftrError::MissingOutput(format!(
+                "{} (available: {})",
+                confidence_name,
+                available_output_names.join(", ")
+            ))
+        })?;
         let confidence = confidence_value
             .try_extract_array::<f32>()
             .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?;
@@ -189,6 +271,16 @@ fn make_nchw_tensor(image: &GrayscaleFrame) -> Result<Tensor<f32>, EfficientLoft
     let array = Array::from_shape_vec((1usize, 1usize, image.height, image.width), data)
         .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?;
     Tensor::from_array(array).map_err(|e| EfficientLoftrError::Ort(e.to_string()))
+}
+
+fn resolve_name(available: &[String], preferred: &str, aliases: &[&str]) -> Option<String> {
+    if available.iter().any(|name| name == preferred) {
+        return Some(preferred.to_string());
+    }
+    aliases
+        .iter()
+        .find_map(|candidate| available.iter().find(|name| name.as_str() == *candidate))
+        .cloned()
 }
 
 fn decode_keypoints(
