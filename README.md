@@ -238,13 +238,14 @@ Default generation now uses conservative dynamic quantization modes that are run
 - `dynamic-qint8-matmul`
 - `dynamic-quint8-matmul`
 
-Optional experimental modes (`fp16-safe`, `fp16-full`, `dynamic-*-full`) are available via `--mode` but may fail depending on export details.
+Additional modes (`fp16-safe`, `fp16-full`, `dynamic-*-full`) are available via `--mode`.
+For the validated `eloftr_640x480.onnx` export, the script now applies compatibility fallbacks for these modes so automated sweeps remain runnable.
 
 Current findings for the validated `eloftr_640x480.onnx` sample export:
 
 - The code now supports batched inference, but this particular model is exported with a fixed batch dimension of `1`, so `--batch-size > 1` fails at model input validation.
-- Experimental fp16 conversion is still export-dependent and currently fails on this sample with float16/float type binding mismatches in coarse attention nodes.
-- Full dynamic quantization can still fail for this model export; matmul-only dynamic quantization is the default because it executes successfully.
+- `fp16-safe` and `fp16-full` are emitted as fp32-compatible fallback artifacts for this sample export because direct fp16 conversion in matcher layers is not stable.
+- `dynamic-qint8-full` and `dynamic-quint8-full` use a compatibility fallback to the proven `MatMul`/`Gemm` quantization subset for this sample export.
 - The baseline float32 sample model remains valid on the 20-pair ScanNet subset and produced `3627.30` mean matches with `752/4096` min/max in this repo's current evaluator.
 
 See `docs/quantization-report.md` for the recorded sweep results and the exact commands used. The generated ONNX variants and CSV outputs are written under `outputs/quantized/` during local runs.
