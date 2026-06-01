@@ -2,6 +2,12 @@
 
 Rust ONNX Runtime wrapper for EfficientLoFTR-style semi-dense matching.
 
+Upstream project references:
+
+- [EfficientLoFTR project page](https://zju3dv.github.io/efficientloftr/)
+- [EfficientLoFTR GitHub repository](https://github.com/zju3dv/efficientloftr)
+- [Validated ONNX weights source](https://huggingface.co/zahilaty/EfficientLoFTR-ONNX)
+
 ## Demo
 
 <table>
@@ -250,6 +256,8 @@ Current findings for the validated `eloftr_640x480.onnx` sample export:
 
 See `docs/quantization-report.md` for the recorded sweep results and the exact commands used. The generated ONNX variants and CSV outputs are written under `outputs/quantized/` during local runs.
 
+For a Rust-specific reproduction flow modeled after the upstream `scripts/reproduce_test/*_auc.sh` scripts, see [docs/rust-reproduction.md](docs/rust-reproduction.md).
+
 ## Known limitations
 
 - Different ONNX exports may use non-standard tensor names or different preprocessing assumptions.
@@ -260,6 +268,19 @@ See `docs/quantization-report.md` for the recorded sweep results and the exact c
 ## Contributing
 
 See `CONTRIBUTING.md` for local development and pull request expectations.
+
+## Citation
+
+If you find this code useful for your research, please cite the upstream EfficientLoFTR paper:
+
+```bibtex
+@inproceedings{wang2024eloftr,
+  title={{Efficient LoFTR}: Semi-Dense Local Feature Matching with Sparse-Like Speed},
+  author={Wang, Yifan and He, Xingyi and Peng, Sida and Tan, Dongli and Zhou, Xiaowei},
+  booktitle={CVPR},
+  year={2024}
+}
+```
 
 ## Library sketch
 
