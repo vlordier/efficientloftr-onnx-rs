@@ -481,6 +481,15 @@ class BatchedTopKWrapper(nn.Module):
         bids = m_bids.to(torch.long)
         conf = mconf.to(torch.float32)
         neg_inf = torch.tensor(-1e9, dtype=conf.dtype, device=conf.device)
+        pad_scores = torch.full((self.max_matches,), neg_inf, dtype=conf.dtype, device=conf.device)
+        mkpts0_pad = torch.cat(
+            [mkpts0, torch.zeros((1, mkpts0.shape[1]), dtype=mkpts0.dtype, device=mkpts0.device)],
+            dim=0,
+        )
+        mkpts1_pad = torch.cat(
+            [mkpts1, torch.zeros((1, mkpts1.shape[1]), dtype=mkpts1.dtype, device=mkpts1.device)],
+            dim=0,
+        )
         out0_rows = []
         out1_rows = []
         outc_rows = []
@@ -488,19 +497,16 @@ class BatchedTopKWrapper(nn.Module):
         for batch_idx in range(self.max_batch):
             batch_mask = bids == batch_idx
             batch_scores = torch.where(batch_mask, conf, neg_inf)
-            k = min(self.max_matches, int(batch_scores.numel()))
-            topk_scores, topk_indices = torch.topk(batch_scores, k=k)
-            if k < self.max_matches:
-                pad = self.max_matches - k
-                topk_scores = torch.cat(
-                    [topk_scores, torch.full((pad,), neg_inf, dtype=topk_scores.dtype, device=topk_scores.device)]
-                )
-                topk_indices = torch.cat(
-                    [topk_indices, torch.zeros((pad,), dtype=topk_indices.dtype, device=topk_indices.device)]
-                )
-            valid = topk_scores > (neg_inf * 0.5)
-            selected0 = mkpts0[topk_indices]
-            selected1 = mkpts1[topk_indices]
+            padded_scores = torch.cat([batch_scores, pad_scores], dim=0)
+            topk_scores, topk_indices = torch.topk(padded_scores, k=self.max_matches)
+            valid = (topk_scores > (neg_inf * 0.5)) & (topk_indices < batch_scores.shape[0])
+
+            invalid0 = torch.full_like(topk_indices, mkpts0.shape[0])
+            invalid1 = torch.full_like(topk_indices, mkpts1.shape[0])
+            gather0 = torch.where(valid, topk_indices, invalid0)
+            gather1 = torch.where(valid, topk_indices, invalid1)
+            selected0 = mkpts0_pad[gather0]
+            selected1 = mkpts1_pad[gather1]
             selectedc = topk_scores
             out0_rows.append(torch.where(valid.unsqueeze(-1), selected0, torch.zeros_like(selected0)))
             out1_rows.append(torch.where(valid.unsqueeze(-1), selected1, torch.zeros_like(selected1)))
