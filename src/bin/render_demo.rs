@@ -8,7 +8,7 @@ use image::{GrayImage, ImageBuffer, Rgb, RgbImage};
 
 #[derive(Parser, Debug)]
 #[command(name = "render_demo")]
-#[command(about = "Render EfficientLoFTR ONNX matches as a side-by-side image")]
+#[command(about = "Render EfficientLoFTR ONNX matches as a split-view image")]
 struct Cli {
     #[arg(long)]
     model: PathBuf,
@@ -56,9 +56,11 @@ fn main() -> Result<(), String> {
 
     let viz_width = args.viz_width.unwrap_or(args.model_width);
     let viz_height = args.viz_height.unwrap_or(args.model_height);
+    let split_x = (viz_width / 2).max(1);
+    let right_panel_width = (viz_width - split_x).max(1);
 
-    let left_rgb = load_rgb_resized(&args.image0, viz_width, viz_height)?;
-    let right_rgb = load_rgb_resized(&args.image1, viz_width, viz_height)?;
+    let left_rgb = load_rgb_resized(&args.image0, split_x, viz_height)?;
+    let right_rgb = load_rgb_resized(&args.image1, right_panel_width, viz_height)?;
     let left_gray = load_grayscale_resized(&args.image0, args.model_width, args.model_height)?;
     let right_gray = load_grayscale_resized(&args.image1, args.model_width, args.model_height)?;
 
@@ -90,15 +92,19 @@ fn main() -> Result<(), String> {
         .match_pair(&frame0, &frame1)
         .map_err(|e| e.to_string())?;
 
-    let sx = viz_width as f32 / args.model_width as f32;
+    let sx_left = split_x as f32 / args.model_width as f32;
+    let sx_right = right_panel_width as f32 / args.model_width as f32;
     let sy = viz_height as f32 / args.model_height as f32;
     let mut matches: Vec<MatchViz> = out
         .confidence
         .iter()
         .enumerate()
         .map(|(i, conf)| MatchViz {
-            p0: (out.keypoints0[i][0] * sx, out.keypoints0[i][1] * sy),
-            p1: (out.keypoints1[i][0] * sx, out.keypoints1[i][1] * sy),
+            p0: (out.keypoints0[i][0] * sx_left, out.keypoints0[i][1] * sy),
+            p1: (
+                split_x as f32 + out.keypoints1[i][0] * sx_right,
+                out.keypoints1[i][1] * sy,
+            ),
             conf: *conf,
         })
         .collect();
@@ -108,7 +114,9 @@ fn main() -> Result<(), String> {
         matches.truncate(args.top_k);
     }
 
-    let canvas = render_matches(&left_rgb, &right_rgb, &matches);
+    let canvas = render_matches(
+        viz_width, viz_height, split_x, &left_rgb, &right_rgb, &matches,
+    );
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -146,13 +154,18 @@ fn load_grayscale_resized(path: &PathBuf, width: u32, height: u32) -> Result<Gra
     ))
 }
 
-fn render_matches(left: &RgbImage, right: &RgbImage, matches: &[MatchViz]) -> RgbImage {
-    let width = left.width();
-    let height = left.height();
-    let mut canvas: RgbImage = ImageBuffer::new(width * 2, height);
+fn render_matches(
+    canvas_width: u32,
+    canvas_height: u32,
+    split_x: u32,
+    left: &RgbImage,
+    right: &RgbImage,
+    matches: &[MatchViz],
+) -> RgbImage {
+    let mut canvas: RgbImage = ImageBuffer::new(canvas_width, canvas_height);
 
     blit_rgb(&mut canvas, left, 0, 0);
-    blit_rgb(&mut canvas, right, width, 0);
+    blit_rgb(&mut canvas, right, split_x, 0);
 
     let min_conf = matches.iter().map(|m| m.conf).fold(f32::INFINITY, f32::min);
     let max_conf = matches
@@ -166,7 +179,7 @@ fn render_matches(left: &RgbImage, right: &RgbImage, matches: &[MatchViz]) -> Rg
         let color = jet_color(t);
         let x0 = m.p0.0.round() as i32;
         let y0 = m.p0.1.round() as i32;
-        let x1 = m.p1.0.round() as i32 + width as i32;
+        let x1 = m.p1.0.round() as i32;
         let y1 = m.p1.1.round() as i32;
         draw_line(&mut canvas, x0, y0, x1, y1, color);
     }
