@@ -2,6 +2,20 @@
 
 Rust ONNX Runtime wrapper for EfficientLoFTR-style semi-dense matching.
 
+## Status
+
+This repository is working end to end for ONNX inference in Rust.
+
+Validated paths:
+
+- Single-pair inference with the `eloftr_640x480.onnx` model and Kornia `kn_church` sample pair
+- Sequence/frame-pair evaluation on the LoFTR ScanNet-756 demo clip using `eval_video_frames`
+
+Current scope:
+
+- The implementation is validated with ONNX exports that follow common EfficientLoFTR output conventions and aliases
+- Inputs should match the exported model's expected resolution (for the validated sample model: `640x480`)
+
 ## What this provides
 
 - Native Rust library API for running ONNX inference on image pairs
@@ -46,6 +60,15 @@ cargo run --release -- \
   --image0 /path/to/image0.png \
   --image1 /path/to/image1.png \
   --output-json /tmp/matches.json
+```
+
+Quick smoke test:
+
+```bash
+cargo run --release -- \
+  --model samples/eloftr_640x480.onnx \
+  --image0 samples/kn_church-2-640x480.jpg \
+  --image1 samples/kn_church-8-640x480.jpg
 ```
 
 Optional tensor names:
@@ -102,6 +125,23 @@ cargo run --release --bin eval_video_frames -- \
 ```
 
 This writes per-pair counts to `outputs/scannet756_matches.csv` and prints summary statistics (mean/min/max/p10/p50/p90).
+
+Example short run with uncapped output checks:
+
+```bash
+cargo run --release --bin eval_video_frames -- \
+  --model samples/eloftr_640x480.onnx \
+  --frames-dir samples/videos/scene0756_frames \
+  --max-pairs 20 \
+  --max-matches 4096 \
+  --output-csv outputs/scannet756_matches_20_max4096.csv
+```
+
+## Known limitations
+
+- Different ONNX exports may use non-standard tensor names or different preprocessing assumptions.
+- Very high-quality adjacent video frames may saturate `--max-matches`; increase the cap when evaluating recall behavior.
+- This project currently focuses on inference and match extraction, not full geometric verification (RANSAC/homography/pose).
 
 ## Contributing
 
