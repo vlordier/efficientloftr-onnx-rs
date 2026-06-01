@@ -151,43 +151,77 @@ def _patch_fine_matching_for_export(matcher: nn.Module) -> None:
         softmax_matrix_f = softmax_matrix_f.reshape(m, self.WW, self.W + 2, self.W + 2)
         softmax_matrix_f = softmax_matrix_f[..., 1:-1, 1:-1].reshape(m, self.WW, self.WW)
 
-        self.get_fine_ds_match(softmax_matrix_f, data)
+        conf_flat = softmax_matrix_f.reshape(m, -1)
+        mconf, idx = torch.max(conf_flat, dim=-1)
+        idx = idx.unsqueeze(-1)
+        idx_l = idx // ww
+        idx_r = idx % ww
 
-        idx_l, idx_r = data["idx_l"], data["idx_r"]
-        m_ids = torch.arange(m, device=idx_l.device, dtype=torch.long).unsqueeze(-1)
-        m_ids = m_ids[: len(data["mconf"])]
-        idx_r_iids, idx_r_jids = idx_r // w, idx_r % w
+        data.update({"idx_l": idx_l, "idx_r": idx_r, "mconf": mconf})
 
-        m_ids = m_ids.reshape(-1)
-        idx_l = idx_l.reshape(-1)
-        idx_r_iids = idx_r_iids.reshape(-1)
-        idx_r_jids = idx_r_jids.reshape(-1)
+        grid = create_meshgrid(w, w, False, conf_matrix_ff.device) - w // 2 + 0.5
+        grid = grid.reshape(1, -1, 2).expand(m, -1, -1)
+        delta_l = torch.gather(grid, 1, idx_l.unsqueeze(-1).expand(-1, -1, 2)).reshape(-1, 2)
+        delta_r = torch.gather(grid, 1, idx_r.unsqueeze(-1).expand(-1, -1, 2)).reshape(-1, 2)
+
+        def normalize_scale(scale_like):
+            if torch.is_tensor(scale_like):
+                t = scale_like.to(device=conf_matrix_ff.device, dtype=delta_l.dtype)
+            else:
+                t = torch.tensor(scale_like, device=conf_matrix_ff.device, dtype=delta_l.dtype)
+
+            if t.dim() == 0:
+                return t.expand(m, 2)
+            if t.dim() == 1:
+                if t.shape[0] == m:
+                    return t.unsqueeze(-1).expand(-1, 2)
+                if t.shape[0] == 2:
+                    return t.unsqueeze(0).expand(m, -1)
+            return t
+
+        if "scale0" in data:
+            scale0 = normalize_scale(scale * data["scale0"][data["b_ids"]])
+            scale1 = normalize_scale(scale * data["scale1"][data["b_ids"]])
+        else:
+            scale0 = normalize_scale(scale)
+            scale1 = normalize_scale(scale)
+
+        mkpts0_c = data["mkpts0_c"] + delta_l * scale0
+        mkpts1_c = data["mkpts1_c"] + delta_r * scale1
+
+        idx_r_iids = (idx_r // w).reshape(-1)
+        idx_r_jids = (idx_r % w).reshape(-1)
+        idx_l_flat = idx_l.reshape(-1)
+        m_ids = torch.arange(m, device=idx_l.device, dtype=torch.long)
         delta = create_meshgrid(3, 3, True, conf_matrix_ff.device).to(torch.long)
 
-        m_ids = m_ids[..., None, None].expand(-1, 3, 3)
-        idx_l = idx_l[..., None, None].expand(-1, 3, 3)
-        idx_r_iids = idx_r_iids[..., None, None].expand(-1, 3, 3) + delta[None, ..., 1]
-        idx_r_jids = idx_r_jids[..., None, None].expand(-1, 3, 3) + delta[None, ..., 0]
+        m_ids = m_ids[:, None, None].expand(-1, 3, 3)
+        idx_l_map = idx_l_flat[:, None, None].expand(-1, 3, 3)
+        idx_r_iids = idx_r_iids[:, None, None].expand(-1, 3, 3) + delta[None, ..., 1]
+        idx_r_jids = idx_r_jids[:, None, None].expand(-1, 3, 3) + delta[None, ..., 0]
+        idx_r_iids = torch.clamp(idx_r_iids, min=0, max=w + 1)
+        idx_r_jids = torch.clamp(idx_r_jids, min=0, max=w + 1)
 
         conf_matrix_ff = conf_matrix_ff.reshape(m, self.WW, self.W + 2, self.W + 2)
-        conf_matrix_ff = conf_matrix_ff[m_ids, idx_l, idx_r_iids, idx_r_jids]
+        conf_matrix_ff = conf_matrix_ff[m_ids, idx_l_map, idx_r_iids, idx_r_jids]
         conf_matrix_ff = conf_matrix_ff.reshape(-1, 9)
         conf_matrix_ff = F.softmax(conf_matrix_ff / self.local_regress_temperature, -1)
         heatmap = conf_matrix_ff.reshape(-1, 3, 3)
 
         coords_normalized = dsnt.spatial_expectation2d(heatmap[None], True)[0]
 
-        if "scale0" in data:
-            scale1 = (
-                scale
-                * data["scale1"][data["b_ids"]][: len(data["mconf"]), ...][:, None, :]
-                .expand(-1, -1, 2)
-                .reshape(-1, 2)
-            )
-        else:
-            scale1 = scale
+        mkpts0_f = mkpts0_c
+        mkpts1_f = mkpts1_c + (coords_normalized * (3 // 2) * scale1)
 
-        self.get_fine_match_local(coords_normalized, data, scale1)
+        data.update(
+            {
+                "mkpts0_c": mkpts0_c,
+                "mkpts1_c": mkpts1_c,
+                "mkpts0_f": mkpts0_f,
+                "mkpts1_f": mkpts1_f,
+                "conf_matrix_f": softmax_matrix_f,
+            }
+        )
 
     fine.forward = types.MethodType(export_friendly_forward, fine)
 
@@ -242,29 +276,28 @@ class BatchedTopKWrapper(nn.Module):
             device=mconf.device,
         )
 
-        if mkpts0.shape[0] > 0:
-            bids = m_bids.to(torch.long)
-            conf = mconf.to(torch.float32)
-            # Stable ordering by (batch id asc, confidence desc).
-            sort_key = bids.to(torch.float32) * 1_000_000.0 - conf
-            order = torch.argsort(sort_key)
+        bids = m_bids.to(torch.long)
+        conf = mconf.to(torch.float32)
+        # Stable ordering by (batch id asc, confidence desc).
+        sort_key = bids.to(torch.float32) * 1_000_000.0 - conf
+        order = torch.argsort(sort_key)
 
-            mkpts0 = mkpts0[order]
-            mkpts1 = mkpts1[order]
-            mconf = mconf[order]
-            bids = bids[order]
+        mkpts0 = mkpts0[order]
+        mkpts1 = mkpts1[order]
+        mconf = mconf[order]
+        bids = bids[order]
 
-            one_hot = F.one_hot(bids, num_classes=self.max_batch).to(torch.long)
-            rank_matrix = torch.cumsum(one_hot, dim=0) - 1
-            row_ids = torch.arange(bids.shape[0], device=bids.device)
-            ranks = rank_matrix[row_ids, bids]
+        one_hot = F.one_hot(bids, num_classes=self.max_batch).to(torch.long)
+        rank_matrix = torch.cumsum(one_hot, dim=0) - 1
+        row_ids = torch.arange(bids.shape[0], device=bids.device)
+        ranks = rank_matrix[row_ids, bids]
 
-            keep = (bids < batch_size) & (ranks < self.max_matches)
-            flat = bids[keep] * self.max_matches + ranks[keep]
+        keep = (bids < batch_size) & (ranks < self.max_matches)
+        flat = bids[keep] * self.max_matches + ranks[keep]
 
-            out0.view(-1, 2)[flat] = mkpts0[keep]
-            out1.view(-1, 2)[flat] = mkpts1[keep]
-            outc.view(-1)[flat] = mconf[keep]
+        out0.view(-1, 2)[flat] = mkpts0[keep]
+        out1.view(-1, 2)[flat] = mkpts1[keep]
+        outc.view(-1)[flat] = mconf[keep]
 
         return (
             out0[:batch_size],
