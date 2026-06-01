@@ -13,7 +13,7 @@ from upstream_efficientloftr import BatchedTopKWrapper, load_upstream_matcher
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export a true dynamic-batch ONNX model from upstream EfficientLoFTR PyTorch weights."
+        description="Export an EfficientLoFTR ONNX model from upstream PyTorch weights."
     )
     parser.add_argument(
         "--upstream-root",
@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-dynamo",
         action="store_true",
-        help="Use legacy tracer exporter instead of dynamo exporter",
+        help="Use the legacy tracer exporter instead of the dynamo exporter",
     )
     parser.add_argument(
         "--export-safe",
@@ -114,10 +114,7 @@ def main() -> int:
             output_names=output_names,
             opset_version=args.opset,
             dynamo=True,
-            dynamic_shapes={
-                "image0": {0: batch_dim},
-                "image1": {0: batch_dim},
-            },
+            dynamic_shapes=({0: batch_dim}, {0: batch_dim}),
         )
 
     model = onnx.load(str(args.output))

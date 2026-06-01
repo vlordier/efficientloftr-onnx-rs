@@ -122,7 +122,8 @@ impl EfficientLoftrMatcher {
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?;
 
-        let xnn_threads = NonZeroUsize::new(thread_count).unwrap_or(NonZeroUsize::new(1).expect("nonzero"));
+        let xnn_threads =
+            NonZeroUsize::new(thread_count).unwrap_or(NonZeroUsize::new(1).expect("nonzero"));
         let xnnpack = XNNPACK::default().with_intra_op_num_threads(xnn_threads);
         if xnnpack
             .is_available()
@@ -394,9 +395,9 @@ fn decode_keypoints_batch(
             }
             Ok(vec![out])
         }
-        [b, n, c] if *b == expected_batch && *c >= 2 => {
-            let mut batches = Vec::with_capacity(*b);
-            for batch_idx in 0..*b {
+        [b, n, c] if *b >= expected_batch && *c >= 2 => {
+            let mut batches = Vec::with_capacity(expected_batch);
+            for batch_idx in 0..expected_batch {
                 let mut out = Vec::with_capacity(*n);
                 for i in 0..*n {
                     out.push([array[[batch_idx, i, 0]], array[[batch_idx, i, 1]]]);
@@ -416,7 +417,7 @@ fn decode_confidence_batch(
 ) -> Result<Vec<Vec<f32>>, EfficientLoftrError> {
     match array.shape() {
         [n] if expected_batch == 1 => Ok(vec![(0..*n).map(|i| array[[i]]).collect()]),
-        [b, n] if *b == expected_batch => Ok((0..*b)
+        [b, n] if *b >= expected_batch => Ok((0..expected_batch)
             .map(|batch_idx| (0..*n).map(|i| array[[batch_idx, i]]).collect())
             .collect()),
         _ => Err(EfficientLoftrError::InvalidOutputShape(name.to_string())),

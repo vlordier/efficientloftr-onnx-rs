@@ -62,10 +62,200 @@ def load_upstream_matcher(
     state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
     matcher.load_state_dict(state_dict, strict=True)
     matcher = reparameter(matcher)
+    _patch_rope_rotate_half_for_export(matcher)
+    _patch_loftr_forward_for_export(matcher)
+    _patch_coarse_matching_for_export(matcher)
     _patch_fine_preprocess_for_export(matcher)
     _patch_fine_matching_for_export(matcher, export_safe=export_safe)
     matcher.eval()
     return matcher
+
+
+def _patch_rope_rotate_half_for_export(matcher: nn.Module) -> None:
+    def rotate_half_no_split(self, x):
+        x1 = x[..., 0::2]
+        x2 = x[..., 1::2]
+        out = torch.empty_like(x)
+        out[..., 0::2] = -x2
+        out[..., 1::2] = x1
+        return out
+
+    for layer in cast(Any, matcher).loftr_coarse.layers:
+        if hasattr(layer, "rope_pos_enc"):
+            layer.rope_pos_enc.rotate_half = types.MethodType(rotate_half_no_split, layer.rope_pos_enc)
+
+
+def _patch_loftr_forward_for_export(matcher: nn.Module) -> None:
+    def export_friendly_forward(self, data):
+        data.update(
+            {
+                "bs": data["image0"].size(0),
+                "hw0_i": data["image0"].shape[2:],
+                "hw1_i": data["image1"].shape[2:],
+            }
+        )
+
+        if data["hw0_i"] == data["hw1_i"]:
+            ret_dict = self.backbone(torch.cat([data["image0"], data["image1"]], dim=0))
+            feats_c = ret_dict["feats_c"]
+            data.update({"feats_x2": ret_dict["feats_x2"], "feats_x1": ret_dict["feats_x1"]})
+            bs = data["bs"]
+            feat_c0 = feats_c[:bs]
+            feat_c1 = feats_c[bs:]
+        else:
+            ret_dict0, ret_dict1 = self.backbone(data["image0"]), self.backbone(data["image1"])
+            feat_c0 = ret_dict0["feats_c"]
+            feat_c1 = ret_dict1["feats_c"]
+            data.update(
+                {
+                    "feats_x2_0": ret_dict0["feats_x2"],
+                    "feats_x1_0": ret_dict0["feats_x1"],
+                    "feats_x2_1": ret_dict1["feats_x2"],
+                    "feats_x1_1": ret_dict1["feats_x1"],
+                }
+            )
+
+        mul = self.config["resolution"][0] // self.config["resolution"][1]
+        data.update(
+            {
+                "hw0_c": feat_c0.shape[2:],
+                "hw1_c": feat_c1.shape[2:],
+                "hw0_f": [feat_c0.shape[2] * mul, feat_c0.shape[3] * mul],
+                "hw1_f": [feat_c1.shape[2] * mul, feat_c1.shape[3] * mul],
+            }
+        )
+
+        mask_c0 = mask_c1 = None
+        if "mask0" in data:
+            mask_c0, mask_c1 = data["mask0"], data["mask1"]
+
+        feat_c0, feat_c1 = self.loftr_coarse(feat_c0, feat_c1, mask_c0, mask_c1)
+        feat_c0 = rearrange(feat_c0, "n c h w -> n (h w) c")
+        feat_c1 = rearrange(feat_c1, "n c h w -> n (h w) c")
+
+        self.coarse_matching(
+            feat_c0,
+            feat_c1,
+            data,
+            mask_c0=mask_c0.view(mask_c0.size(0), -1) if mask_c0 is not None else mask_c0,
+            mask_c1=mask_c1.view(mask_c1.size(0), -1) if mask_c1 is not None else mask_c1,
+        )
+
+        feat_c0, feat_c1 = map(lambda feat: feat / feat.shape[-1] ** 0.5, [feat_c0, feat_c1])
+        feat_f0_unfold, feat_f1_unfold = self.fine_preprocess(feat_c0, feat_c1, data)
+        del feat_c0, feat_c1, mask_c0, mask_c1
+        self.fine_matching(feat_f0_unfold, feat_f1_unfold, data)
+
+    matcher.forward = types.MethodType(export_friendly_forward, matcher)
+
+
+def _patch_coarse_matching_for_export(matcher: nn.Module) -> None:
+    from src.loftr.utils.coarse_matching import (
+        compute_max_candidates,
+        mask_border,
+        mask_border_with_padding,
+    )
+
+    coarse = cast(Any, matcher).coarse_matching
+
+    def export_friendly_get_coarse_match(self, conf_matrix, data):
+        axes_lengths = {
+            "h0c": data["hw0_c"][0],
+            "w0c": data["hw0_c"][1],
+            "h1c": data["hw1_c"][0],
+            "w1c": data["hw1_c"][1],
+        }
+        _device = conf_matrix.device
+        mask = conf_matrix > self.thr
+        mask = rearrange(
+            mask,
+            "b (h0c w0c) (h1c w1c) -> b h0c w0c h1c w1c",
+            **axes_lengths,
+        )
+
+        if "mask0" not in data:
+            mask_border(mask, self.border_rm, False)
+        else:
+            mask_border_with_padding(mask, self.border_rm, False, data["mask0"], data["mask1"])
+        mask = rearrange(
+            mask,
+            "b h0c w0c h1c w1c -> b (h0c w0c) (h1c w1c)",
+            **axes_lengths,
+        )
+
+        mask = mask * (conf_matrix == conf_matrix.max(dim=2, keepdim=True)[0]) * (
+            conf_matrix == conf_matrix.max(dim=1, keepdim=True)[0]
+        )
+
+        mask_int = mask.to(torch.int64)
+        mask_v, all_j_ids = mask_int.max(dim=2)
+        b_ids, i_ids = torch.where(mask_v > 0)
+        j_ids = all_j_ids[b_ids, i_ids]
+        mconf = conf_matrix[b_ids, i_ids, j_ids]
+
+        if self.training:
+            if "mask0" not in data:
+                num_candidates_max = mask.size(0) * max(mask.size(1), mask.size(2))
+            else:
+                num_candidates_max = compute_max_candidates(data["mask0"], data["mask1"])
+            num_matches_train = int(num_candidates_max * self.train_coarse_percent)
+            num_matches_pred = len(b_ids)
+            assert self.train_pad_num_gt_min < num_matches_train, "min-num-gt-pad should be less than num-train-matches"
+
+            if num_matches_pred <= num_matches_train - self.train_pad_num_gt_min:
+                pred_indices = torch.arange(num_matches_pred, device=_device)
+            else:
+                pred_indices = torch.randint(
+                    num_matches_pred,
+                    (num_matches_train - self.train_pad_num_gt_min,),
+                    device=_device,
+                )
+
+            gt_pad_indices = torch.randint(
+                len(data["spv_b_ids"]),
+                (max(num_matches_train - num_matches_pred, self.train_pad_num_gt_min),),
+                device=_device,
+            )
+            mconf_gt = torch.zeros(len(data["spv_b_ids"]), device=_device)
+
+            b_ids, i_ids, j_ids, mconf = map(
+                lambda x, y: torch.cat([x[pred_indices], y[gt_pad_indices]], dim=0),
+                *zip(
+                    [b_ids, data["spv_b_ids"]],
+                    [i_ids, data["spv_i_ids"]],
+                    [j_ids, data["spv_j_ids"]],
+                    [mconf, mconf_gt],
+                ),
+            )
+
+        coarse_matches = {"b_ids": b_ids, "i_ids": i_ids, "j_ids": j_ids}
+
+        scale = data["hw0_i"][0] / data["hw0_c"][0]
+
+        scale0 = scale * data["scale0"][b_ids] if "scale0" in data else scale
+        scale1 = scale * data["scale1"][b_ids] if "scale1" in data else scale
+        mkpts0_c = torch.stack(
+            [i_ids % data["hw0_c"][1], i_ids // data["hw0_c"][1]],
+            dim=1,
+        ) * scale0
+        mkpts1_c = torch.stack(
+            [j_ids % data["hw1_c"][1], j_ids // data["hw1_c"][1]],
+            dim=1,
+        ) * scale1
+
+        m_bids = b_ids[mconf != 0]
+        coarse_matches.update(
+            {
+                "m_bids": m_bids,
+                "mkpts0_c": mkpts0_c[mconf != 0],
+                "mkpts1_c": mkpts1_c[mconf != 0],
+                "mconf": mconf[mconf != 0],
+            }
+        )
+
+        return coarse_matches
+
+    coarse.get_coarse_match = types.MethodType(export_friendly_get_coarse_match, coarse)
 
 
 def _patch_fine_preprocess_for_export(matcher: nn.Module) -> None:
@@ -92,15 +282,27 @@ def _patch_fine_preprocess_for_export(matcher: nn.Module) -> None:
             del data["feats_x2"], data["feats_x1"]
 
             x1 = self.inter_fpn(feat_c, x2, x1, stride)
-            feat_f0, feat_f1 = torch.chunk(x1, 2, dim=0)
+            bs = data["bs"]
+            feat_f0 = x1[:bs]
+            feat_f1 = x1[bs:]
 
             feat_f0 = F.unfold(feat_f0, kernel_size=(w, w), stride=stride, padding=0)
             feat_f0 = rearrange(feat_f0, "n (c ww) l -> n l ww c", ww=w**2)
             feat_f1 = F.unfold(feat_f1, kernel_size=(w + 2, w + 2), stride=stride, padding=1)
             feat_f1 = rearrange(feat_f1, "n (c ww) l -> n l ww c", ww=(w + 2) ** 2)
 
-            feat_f0 = feat_f0[data["b_ids"], data["i_ids"]]
-            feat_f1 = feat_f1[data["b_ids"], data["j_ids"]]
+            feat_f0 = feat_f0.reshape(-1, feat_f0.shape[2], feat_f0.shape[3])
+            feat_f1 = feat_f1.reshape(-1, feat_f1.shape[2], feat_f1.shape[3])
+            feat_f0 = torch.index_select(
+                feat_f0,
+                0,
+                (data["b_ids"] * data["hw0_c"][1] + data["i_ids"]).to(torch.long),
+            )
+            feat_f1 = torch.index_select(
+                feat_f1,
+                0,
+                (data["b_ids"] * data["hw1_c"][1] + data["j_ids"]).to(torch.long),
+            )
             return feat_f0, feat_f1
 
         feat_c0 = rearrange(feat_c0, "b (h w) c -> b c h w", h=data["hw0_c"][0])
@@ -117,8 +319,18 @@ def _patch_fine_preprocess_for_export(matcher: nn.Module) -> None:
         feat_f1 = F.unfold(feat_f1, kernel_size=(w + 2, w + 2), stride=stride, padding=1)
         feat_f1 = rearrange(feat_f1, "n (c ww) l -> n l ww c", ww=(w + 2) ** 2)
 
-        feat_f0 = feat_f0[data["b_ids"], data["i_ids"]]
-        feat_f1 = feat_f1[data["b_ids"], data["j_ids"]]
+        feat_f0 = feat_f0.reshape(-1, feat_f0.shape[2], feat_f0.shape[3])
+        feat_f1 = feat_f1.reshape(-1, feat_f1.shape[2], feat_f1.shape[3])
+        feat_f0 = torch.index_select(
+            feat_f0,
+            0,
+            (data["b_ids"] * data["hw0_c"][1] + data["i_ids"]).to(torch.long),
+        )
+        feat_f1 = torch.index_select(
+            feat_f1,
+            0,
+            (data["b_ids"] * data["hw1_c"][1] + data["j_ids"]).to(torch.long),
+        )
         return feat_f0, feat_f1
 
     fine.forward = types.MethodType(export_friendly_forward, fine)
@@ -255,12 +467,6 @@ class BatchedTopKWrapper(nn.Module):
         self.max_batch = int(max_batch)
 
     def forward(self, image0: torch.Tensor, image1: torch.Tensor):
-        batch_size = image0.shape[0]
-        if batch_size > self.max_batch:
-            raise RuntimeError(
-                f"batch size {batch_size} exceeds wrapper max_batch={self.max_batch}"
-            )
-
         data = {"image0": image0, "image1": image1}
         self.matcher(data)
 
@@ -272,48 +478,23 @@ class BatchedTopKWrapper(nn.Module):
             torch.zeros((mconf.shape[0],), dtype=torch.long, device=mconf.device),
         )
 
-        out0 = torch.zeros(
-            (self.max_batch, self.max_matches, 2),
-            dtype=mkpts0.dtype,
-            device=mkpts0.device,
-        )
-        out1 = torch.zeros(
-            (self.max_batch, self.max_matches, 2),
-            dtype=mkpts1.dtype,
-            device=mkpts1.device,
-        )
-        outc = torch.full(
-            (self.max_batch, self.max_matches),
-            -1.0,
-            dtype=mconf.dtype,
-            device=mconf.device,
-        )
-
         bids = m_bids.to(torch.long)
         conf = mconf.to(torch.float32)
-        # Stable ordering by (batch id asc, confidence desc).
-        sort_key = bids.to(torch.float32) * 1_000_000.0 - conf
-        order = torch.argsort(sort_key)
+        neg_inf = torch.tensor(-1e9, dtype=conf.dtype, device=conf.device)
+        out0_rows = []
+        out1_rows = []
+        outc_rows = []
 
-        mkpts0 = mkpts0[order]
-        mkpts1 = mkpts1[order]
-        mconf = mconf[order]
-        bids = bids[order]
+        for batch_idx in range(self.max_batch):
+            batch_mask = bids == batch_idx
+            batch_scores = torch.where(batch_mask, conf, neg_inf)
+            topk_scores, topk_indices = torch.topk(batch_scores, k=self.max_matches)
+            valid = topk_scores > (neg_inf * 0.5)
+            selected0 = mkpts0[topk_indices]
+            selected1 = mkpts1[topk_indices]
+            selectedc = topk_scores
+            out0_rows.append(torch.where(valid.unsqueeze(-1), selected0, torch.zeros_like(selected0)))
+            out1_rows.append(torch.where(valid.unsqueeze(-1), selected1, torch.zeros_like(selected1)))
+            outc_rows.append(torch.where(valid, selectedc, torch.full_like(selectedc, -1.0)))
 
-        one_hot = F.one_hot(bids, num_classes=self.max_batch).to(torch.long)
-        rank_matrix = torch.cumsum(one_hot, dim=0) - 1
-        row_ids = torch.arange(bids.shape[0], device=bids.device)
-        ranks = rank_matrix[row_ids, bids]
-
-        keep = (bids < batch_size) & (ranks < self.max_matches)
-        flat = bids[keep] * self.max_matches + ranks[keep]
-
-        out0.view(-1, 2)[flat] = mkpts0[keep]
-        out1.view(-1, 2)[flat] = mkpts1[keep]
-        outc.view(-1)[flat] = mconf[keep]
-
-        return (
-            out0[:batch_size],
-            out1[:batch_size],
-            outc[:batch_size],
-        )
+        return torch.stack(out0_rows, dim=0), torch.stack(out1_rows, dim=0), torch.stack(outc_rows, dim=0)

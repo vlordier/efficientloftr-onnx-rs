@@ -33,6 +33,7 @@ Validated paths:
 
 - Single-pair inference with the `eloftr_640x480.onnx` model and Kornia `kn_church` sample pair
 - Sequence/frame-pair evaluation on the LoFTR ScanNet-756 demo clip using `eval_video_frames`
+- The upstream-exported EfficientLoFTR ONNX path currently runs as a fixed-batch-2 model; `eval_video_frames` falls back to that fixed batch size when a larger batch is requested
 
 Current scope:
 

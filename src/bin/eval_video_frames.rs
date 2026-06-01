@@ -435,14 +435,7 @@ fn resolve_effective_batch_size(
     let support = detect_batch_support(model)?;
     match support {
         BatchSupport::Dynamic | BatchSupport::Unknown => Ok(requested_batch_size),
-        BatchSupport::Fixed(1) => Ok(1),
-        BatchSupport::Fixed(expected) if requested_batch_size == expected => Ok(expected),
-        BatchSupport::Fixed(expected) => Err(format!(
-            "model {} requires fixed batch size {}, but requested {}",
-            model.display(),
-            expected,
-            requested_batch_size
-        )),
+        BatchSupport::Fixed(expected) => Ok(expected),
     }
 }
 
