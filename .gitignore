@@ -1,3 +1,5 @@
 /target
 /samples
 /outputs
+__pycache__/
+*.pyc
