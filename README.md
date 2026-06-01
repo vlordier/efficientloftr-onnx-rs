@@ -15,6 +15,29 @@ Rust ONNX Runtime wrapper for EfficientLoFTR-style semi-dense matching.
 cargo build --release
 ```
 
+## Quality and linting
+
+This repository uses:
+
+- `rustfmt` for formatting
+- `clippy` for linting (`-D warnings`)
+- `cargo test` for test validation
+- GitHub Actions CI in `.github/workflows/ci.yml`
+
+Run all local quality checks with:
+
+```bash
+just ci
+```
+
+or manually:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+```
+
 ## CLI usage
 
 ```bash
@@ -56,6 +79,33 @@ cargo run --release -- \
   --image1 samples/kn_church-8-640x480.jpg \
   --output-json samples/matches.json
 ```
+
+## ScanNet video-style evaluation (LoFTR project clip)
+
+The LoFTR project page includes a ScanNet sequence clip (`scene0756`) used for qualitative evaluation. You can run this matcher over consecutive frames:
+
+```bash
+mkdir -p samples/videos
+curl -L --fail -o samples/videos/loftr_scene0756_00_slow.mp4 \
+  https://zju3dv.github.io/loftr/images/loftr_scene0756_00_slow.mp4
+
+# On macOS, use Homebrew ffmpeg path to avoid Linux binary conflicts in /usr/local/bin.
+/opt/homebrew/bin/ffmpeg -y \
+  -i samples/videos/loftr_scene0756_00_slow.mp4 \
+  -vf "fps=4,scale=640:480" \
+  samples/videos/scene0756_frames/frame_%05d.jpg
+
+cargo run --release --bin eval_video_frames -- \
+  --model samples/eloftr_640x480.onnx \
+  --frames-dir samples/videos/scene0756_frames \
+  --output-csv outputs/scannet756_matches.csv
+```
+
+This writes per-pair counts to `outputs/scannet756_matches.csv` and prints summary statistics (mean/min/max/p10/p50/p90).
+
+## Contributing
+
+See `CONTRIBUTING.md` for local development and pull request expectations.
 
 ## Library sketch
 
