@@ -50,6 +50,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use legacy tracer exporter instead of dynamo exporter",
     )
+    parser.add_argument(
+        "--export-safe",
+        action="store_true",
+        help="Use export-safe fine matching path (skips fragile local refinement branch)",
+    )
     return parser.parse_args()
 
 
@@ -65,6 +70,7 @@ def main() -> int:
         upstream_root=args.upstream_root,
         checkpoint=args.checkpoint,
         model_type=args.model_type,
+        export_safe=args.export_safe,
     )
     wrapper = BatchedTopKWrapper(
         matcher,

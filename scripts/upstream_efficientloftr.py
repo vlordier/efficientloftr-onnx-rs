@@ -42,6 +42,7 @@ def load_upstream_matcher(
     upstream_root: Path,
     checkpoint: Path,
     model_type: str = "full",
+    export_safe: bool = False,
 ) -> nn.Module:
     LoFTR, full_default_cfg, opt_default_cfg, reparameter = _import_upstream(upstream_root)
 
@@ -62,7 +63,7 @@ def load_upstream_matcher(
     matcher.load_state_dict(state_dict, strict=True)
     matcher = reparameter(matcher)
     _patch_fine_preprocess_for_export(matcher)
-    _patch_fine_matching_for_export(matcher)
+    _patch_fine_matching_for_export(matcher, export_safe=export_safe)
     matcher.eval()
     return matcher
 
@@ -123,7 +124,7 @@ def _patch_fine_preprocess_for_export(matcher: nn.Module) -> None:
     fine.forward = types.MethodType(export_friendly_forward, fine)
 
 
-def _patch_fine_matching_for_export(matcher: nn.Module) -> None:
+def _patch_fine_matching_for_export(matcher: nn.Module, export_safe: bool = False) -> None:
     fine = cast(Any, matcher).fine_matching
     w_fixed = int(cast(Any, matcher).fine_preprocess.W)
 
@@ -188,6 +189,18 @@ def _patch_fine_matching_for_export(matcher: nn.Module) -> None:
 
         mkpts0_c = data["mkpts0_c"] + delta_l * scale0
         mkpts1_c = data["mkpts1_c"] + delta_r * scale1
+
+        if export_safe:
+            data.update(
+                {
+                    "mkpts0_c": mkpts0_c,
+                    "mkpts1_c": mkpts1_c,
+                    "mkpts0_f": mkpts0_c,
+                    "mkpts1_f": mkpts1_c,
+                    "conf_matrix_f": softmax_matrix_f,
+                }
+            )
+            return
 
         idx_r_iids = (idx_r // w).reshape(-1)
         idx_r_jids = (idx_r % w).reshape(-1)
