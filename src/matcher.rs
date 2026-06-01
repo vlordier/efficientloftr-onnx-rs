@@ -1,8 +1,10 @@
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use image::ImageReader;
 use ndarray::{Array, ArrayViewD};
+use ort::ep::{ExecutionProvider, XNNPACK};
 use ort::session::{Session, builder::GraphOptimizationLevel};
 use ort::value::Tensor;
 use serde::{Deserialize, Serialize};
@@ -118,11 +120,28 @@ impl EfficientLoftrMatcher {
         let mut builder = Session::builder()
             .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?
-            .with_parallel_execution(true)
-            .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?
-            .with_intra_threads(thread_count)
             .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?;
+
+        let xnn_threads = NonZeroUsize::new(thread_count).unwrap_or(NonZeroUsize::new(1).expect("nonzero"));
+        let xnnpack = XNNPACK::default().with_intra_op_num_threads(xnn_threads);
+        if xnnpack
+            .is_available()
+            .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?
+        {
+            builder = builder
+                .with_intra_op_spinning(false)
+                .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?
+                .with_intra_threads(1)
+                .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?
+                .with_execution_providers([xnnpack.build()])
+                .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?;
+        } else {
+            builder = builder
+                .with_parallel_execution(true)
+                .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?
+                .with_intra_threads(thread_count)
+                .map_err(|e| EfficientLoftrError::Ort(e.to_string()))?;
+        }
 
         let session = builder
             .commit_from_file(model_path)
