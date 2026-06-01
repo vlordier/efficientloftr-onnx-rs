@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use efficientloftr_onnx_rs::{EfficientLoftrConfig, EfficientLoftrMatcher};
 use image::imageops::FilterType;
-use image::{GrayImage, ImageBuffer, Luma, Rgb, RgbImage};
+use image::{GrayImage, ImageBuffer, Rgb, RgbImage};
 
 #[derive(Parser, Debug)]
 #[command(name = "render_demo")]
@@ -19,9 +19,13 @@ struct Cli {
     #[arg(long)]
     output: PathBuf,
     #[arg(long, default_value_t = 640)]
-    width: u32,
+    model_width: u32,
     #[arg(long, default_value_t = 480)]
-    height: u32,
+    model_height: u32,
+    #[arg(long)]
+    viz_width: Option<u32>,
+    #[arg(long)]
+    viz_height: Option<u32>,
     #[arg(long, default_value_t = 800)]
     top_k: usize,
     #[arg(long, default_value = "image0")]
@@ -50,8 +54,13 @@ struct MatchViz {
 fn main() -> Result<(), String> {
     let args = Cli::parse();
 
-    let left = load_grayscale_resized(&args.image0, args.width, args.height)?;
-    let right = load_grayscale_resized(&args.image1, args.width, args.height)?;
+    let viz_width = args.viz_width.unwrap_or(args.model_width);
+    let viz_height = args.viz_height.unwrap_or(args.model_height);
+
+    let left_rgb = load_rgb_resized(&args.image0, viz_width, viz_height)?;
+    let right_rgb = load_rgb_resized(&args.image1, viz_width, viz_height)?;
+    let left_gray = load_grayscale_resized(&args.image0, args.model_width, args.model_height)?;
+    let right_gray = load_grayscale_resized(&args.image1, args.model_width, args.model_height)?;
 
     let config = EfficientLoftrConfig {
         input0_name: args.input0_name,
@@ -67,27 +76,29 @@ fn main() -> Result<(), String> {
         EfficientLoftrMatcher::from_model_path(&args.model, config).map_err(|e| e.to_string())?;
 
     let frame0 = efficientloftr_onnx_rs::GrayscaleFrame {
-        width: args.width as usize,
-        height: args.height as usize,
-        pixels: left.clone().into_raw(),
+        width: args.model_width as usize,
+        height: args.model_height as usize,
+        pixels: left_gray.clone().into_raw(),
     };
     let frame1 = efficientloftr_onnx_rs::GrayscaleFrame {
-        width: args.width as usize,
-        height: args.height as usize,
-        pixels: right.clone().into_raw(),
+        width: args.model_width as usize,
+        height: args.model_height as usize,
+        pixels: right_gray.clone().into_raw(),
     };
 
     let out = matcher
         .match_pair(&frame0, &frame1)
         .map_err(|e| e.to_string())?;
 
+    let sx = viz_width as f32 / args.model_width as f32;
+    let sy = viz_height as f32 / args.model_height as f32;
     let mut matches: Vec<MatchViz> = out
         .confidence
         .iter()
         .enumerate()
         .map(|(i, conf)| MatchViz {
-            p0: (out.keypoints0[i][0], out.keypoints0[i][1]),
-            p1: (out.keypoints1[i][0], out.keypoints1[i][1]),
+            p0: (out.keypoints0[i][0] * sx, out.keypoints0[i][1] * sy),
+            p1: (out.keypoints1[i][0] * sx, out.keypoints1[i][1] * sy),
             conf: *conf,
         })
         .collect();
@@ -97,7 +108,7 @@ fn main() -> Result<(), String> {
         matches.truncate(args.top_k);
     }
 
-    let canvas = render_matches(&left, &right, &matches);
+    let canvas = render_matches(&left_rgb, &right_rgb, &matches);
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -109,6 +120,18 @@ fn main() -> Result<(), String> {
     );
 
     Ok(())
+}
+
+fn load_rgb_resized(path: &PathBuf, width: u32, height: u32) -> Result<RgbImage, String> {
+    let img = image::open(path)
+        .map_err(|e| format!("failed to open {}: {e}", path.display()))?
+        .to_rgb8();
+    Ok(image::imageops::resize(
+        &img,
+        width,
+        height,
+        FilterType::Triangle,
+    ))
 }
 
 fn load_grayscale_resized(path: &PathBuf, width: u32, height: u32) -> Result<GrayImage, String> {
@@ -123,13 +146,13 @@ fn load_grayscale_resized(path: &PathBuf, width: u32, height: u32) -> Result<Gra
     ))
 }
 
-fn render_matches(left: &GrayImage, right: &GrayImage, matches: &[MatchViz]) -> RgbImage {
+fn render_matches(left: &RgbImage, right: &RgbImage, matches: &[MatchViz]) -> RgbImage {
     let width = left.width();
     let height = left.height();
     let mut canvas: RgbImage = ImageBuffer::new(width * 2, height);
 
-    blit_grayscale(&mut canvas, left, 0, 0);
-    blit_grayscale(&mut canvas, right, width, 0);
+    blit_rgb(&mut canvas, left, 0, 0);
+    blit_rgb(&mut canvas, right, width, 0);
 
     let min_conf = matches.iter().map(|m| m.conf).fold(f32::INFINITY, f32::min);
     let max_conf = matches
@@ -151,11 +174,10 @@ fn render_matches(left: &GrayImage, right: &GrayImage, matches: &[MatchViz]) -> 
     canvas
 }
 
-fn blit_grayscale(canvas: &mut RgbImage, image: &GrayImage, ox: u32, oy: u32) {
+fn blit_rgb(canvas: &mut RgbImage, image: &RgbImage, ox: u32, oy: u32) {
     for y in 0..image.height() {
         for x in 0..image.width() {
-            let Luma([v]) = *image.get_pixel(x, y);
-            canvas.put_pixel(ox + x, oy + y, Rgb([v, v, v]));
+            canvas.put_pixel(ox + x, oy + y, *image.get_pixel(x, y));
         }
     }
 }

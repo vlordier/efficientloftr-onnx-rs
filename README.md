@@ -17,6 +17,7 @@ Rust ONNX Runtime wrapper for EfficientLoFTR-style semi-dense matching.
 
 The left image is the Kornia LoFTR reference demo. The right image is generated in this repository using the same
 `kn_church-2.jpg` and `kn_church-8.jpg` pair used by the Kornia/LoFTR tutorials.
+The generated panel keeps image colors and supports an independent visualization resize.
 
 ## Status
 
@@ -132,8 +133,10 @@ cargo run --release --bin render_demo -- \
   --image0 samples/kn_church-2.jpg \
   --image1 samples/kn_church-8.jpg \
   --output docs/images/efficientloftr-onnx-rs-demo.png \
-  --width 640 \
-  --height 480 \
+  --model-width 640 \
+  --model-height 480 \
+  --viz-width 480 \
+  --viz-height 360 \
   --top-k 1500 \
   --max-matches 4096
 ```
