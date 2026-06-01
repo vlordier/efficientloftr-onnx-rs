@@ -3,7 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use efficientloftr_onnx_rs::{EfficientLoftrConfig, EfficientLoftrMatcher, GrayscaleFrame};
+use efficientloftr_onnx_rs::{
+    EfficientLoftrConfig, EfficientLoftrMatcher, GrayscaleFrame, MatchDiagnostics,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "eval-video-frames")]
@@ -93,31 +95,36 @@ fn main() -> Result<(), String> {
     }
 
     let mut pair_csv_lines = vec![
-        "model,pair,image0,image1,match_count,batch_latency_ms,per_pair_latency_ms".to_string(),
+        "model,pair,image0,image1,match_count,raw_keypoints0_count,raw_keypoints1_count,candidate_count,kept_ratio,raw_conf_mean,raw_conf_p50,raw_conf_p90,batch_latency_ms,per_pair_latency_ms".to_string(),
     ];
     let mut summary_csv_lines = vec![
-        "model,status,pairs,mean_matches,min_matches,max_matches,p10,p50,p90,batch_size,elapsed_ms,mean_pair_latency_ms,p50_pair_latency_ms,pairs_per_sec,error".to_string(),
+        "model,status,pairs,mean_matches,min_matches,max_matches,p10,p50,p90,batch_size,elapsed_ms,mean_pair_latency_ms,p50_pair_latency_ms,pairs_per_sec,mean_raw_keypoints0,mean_raw_keypoints1,mean_candidate_count,mean_kept_ratio,mean_raw_conf_mean,p50_raw_conf_mean,p90_raw_conf_mean,error".to_string(),
     ];
 
     for model in &args.model {
         match evaluate_model(model, &config, &pair_specs, args.batch_size) {
             Ok(summary) => {
-                for (pair_id, image0, image1, count, batch_latency_ms, pair_latency_ms) in
-                    &summary.rows
-                {
+                for row in &summary.rows {
                     pair_csv_lines.push(format!(
-                        "{},{},{},{},{},{:.3},{:.3}",
+                        "{},{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{:.6},{:.3},{:.3}",
                         model.display(),
-                        pair_id,
-                        image0.display(),
-                        image1.display(),
-                        count,
-                        batch_latency_ms,
-                        pair_latency_ms
+                        row.pair_id,
+                        row.image0.display(),
+                        row.image1.display(),
+                        row.match_count,
+                        row.diagnostics.raw_keypoints0_count,
+                        row.diagnostics.raw_keypoints1_count,
+                        row.diagnostics.candidate_count,
+                        row.diagnostics.kept_ratio,
+                        row.diagnostics.raw_conf_mean,
+                        row.diagnostics.raw_conf_p50,
+                        row.diagnostics.raw_conf_p90,
+                        row.batch_latency_ms,
+                        row.pair_latency_ms
                     ));
                 }
                 summary_csv_lines.push(format!(
-                    "{},ok,{},{:.2},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},",
+                    "{},ok,{},{:.2},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.2},{:.2},{:.2},{:.6},{:.6},{:.6},{:.6},",
                     model.display(),
                     summary.counts.len(),
                     summary.mean,
@@ -130,7 +137,14 @@ fn main() -> Result<(), String> {
                     summary.elapsed_ms,
                     summary.mean_pair_latency_ms,
                     summary.p50_pair_latency_ms,
-                    summary.pairs_per_sec
+                    summary.pairs_per_sec,
+                    summary.mean_raw_keypoints0,
+                    summary.mean_raw_keypoints1,
+                    summary.mean_candidate_count,
+                    summary.mean_kept_ratio,
+                    summary.mean_raw_conf_mean,
+                    summary.p50_raw_conf_mean,
+                    summary.p90_raw_conf_mean
                 ));
 
                 println!("model: {}", model.display());
@@ -148,13 +162,26 @@ fn main() -> Result<(), String> {
                     summary.mean_pair_latency_ms, summary.p50_pair_latency_ms
                 );
                 println!("pairs/sec: {:.3}", summary.pairs_per_sec);
+                println!(
+                    "mean raw kpts0/kpts1/candidates: {:.2}/{:.2}/{:.2}",
+                    summary.mean_raw_keypoints0,
+                    summary.mean_raw_keypoints1,
+                    summary.mean_candidate_count
+                );
+                println!(
+                    "mean kept ratio: {:.6} | raw conf mean/p50/p90: {:.6}/{:.6}/{:.6}",
+                    summary.mean_kept_ratio,
+                    summary.mean_raw_conf_mean,
+                    summary.p50_raw_conf_mean,
+                    summary.p90_raw_conf_mean
+                );
             }
             Err(error) => {
                 if args.model.len() == 1 {
                     return Err(error);
                 }
                 let mut fields = vec![model.display().to_string(), "error".to_string()];
-                for _ in 0..12 {
+                for _ in 0..19 {
                     fields.push(String::new());
                 }
                 fields.push(csv_escape(&error));
@@ -179,7 +206,7 @@ fn main() -> Result<(), String> {
 
 struct EvalSummary {
     counts: Vec<usize>,
-    rows: Vec<(usize, PathBuf, PathBuf, usize, f64, f64)>,
+    rows: Vec<PairMetricsRow>,
     mean: f64,
     min: usize,
     max: usize,
@@ -190,6 +217,23 @@ struct EvalSummary {
     mean_pair_latency_ms: f64,
     p50_pair_latency_ms: f64,
     pairs_per_sec: f64,
+    mean_raw_keypoints0: f64,
+    mean_raw_keypoints1: f64,
+    mean_candidate_count: f64,
+    mean_kept_ratio: f64,
+    mean_raw_conf_mean: f64,
+    p50_raw_conf_mean: f64,
+    p90_raw_conf_mean: f64,
+}
+
+struct PairMetricsRow {
+    pair_id: usize,
+    image0: PathBuf,
+    image1: PathBuf,
+    match_count: usize,
+    diagnostics: MatchDiagnostics,
+    batch_latency_ms: f64,
+    pair_latency_ms: f64,
 }
 
 fn collect_pair_specs(
@@ -229,6 +273,11 @@ fn evaluate_model(
     let mut rows = Vec::with_capacity(pair_specs.len());
     let mut counts = Vec::with_capacity(pair_specs.len());
     let mut pair_latency_ms = Vec::with_capacity(pair_specs.len());
+    let mut raw_keypoints0_counts = Vec::with_capacity(pair_specs.len());
+    let mut raw_keypoints1_counts = Vec::with_capacity(pair_specs.len());
+    let mut candidate_counts = Vec::with_capacity(pair_specs.len());
+    let mut kept_ratios = Vec::with_capacity(pair_specs.len());
+    let mut raw_conf_means = Vec::with_capacity(pair_specs.len());
 
     let mut offset = 0usize;
     while offset < pair_specs.len() {
@@ -258,28 +307,38 @@ fn evaluate_model(
         let batch0: Vec<&GrayscaleFrame> = frames0.iter().collect();
         let batch1: Vec<&GrayscaleFrame> = frames1.iter().collect();
         let batch_started = std::time::Instant::now();
-        let matches = matcher.match_batch(&batch0, &batch1).map_err(|e| {
-            format!(
-                "model {} batch starting at pair {} failed: {e}",
-                model.display(),
-                batch_specs[0].0
-            )
-        })?;
+        let matches = matcher
+            .match_batch_with_diagnostics(&batch0, &batch1)
+            .map_err(|e| {
+                format!(
+                    "model {} batch starting at pair {} failed: {e}",
+                    model.display(),
+                    batch_specs[0].0
+                )
+            })?;
         let batch_latency_ms = batch_started.elapsed().as_secs_f64() * 1000.0;
         let per_pair_latency_ms = batch_latency_ms / batch_specs.len() as f64;
 
-        for ((pair_id, image0, image1), match_output) in batch_specs.iter().zip(matches) {
+        for ((pair_id, image0, image1), (match_output, diagnostics)) in
+            batch_specs.iter().zip(matches)
+        {
             let count = match_output.confidence.len();
             counts.push(count);
             pair_latency_ms.push(per_pair_latency_ms);
-            rows.push((
-                *pair_id,
-                image0.clone(),
-                image1.clone(),
-                count,
+            raw_keypoints0_counts.push(diagnostics.raw_keypoints0_count as f64);
+            raw_keypoints1_counts.push(diagnostics.raw_keypoints1_count as f64);
+            candidate_counts.push(diagnostics.candidate_count as f64);
+            kept_ratios.push(diagnostics.kept_ratio as f64);
+            raw_conf_means.push(diagnostics.raw_conf_mean as f64);
+            rows.push(PairMetricsRow {
+                pair_id: *pair_id,
+                image0: image0.clone(),
+                image1: image1.clone(),
+                match_count: count,
+                diagnostics,
                 batch_latency_ms,
-                per_pair_latency_ms,
-            ));
+                pair_latency_ms: per_pair_latency_ms,
+            });
         }
 
         offset = upper;
@@ -311,6 +370,17 @@ fn evaluate_model(
     } else {
         0.0
     };
+    let mut raw_conf_means_sorted = raw_conf_means.clone();
+    raw_conf_means_sorted.sort_by(|a, b| a.total_cmp(b));
+    let mean_raw_keypoints0 =
+        raw_keypoints0_counts.iter().sum::<f64>() / raw_keypoints0_counts.len() as f64;
+    let mean_raw_keypoints1 =
+        raw_keypoints1_counts.iter().sum::<f64>() / raw_keypoints1_counts.len() as f64;
+    let mean_candidate_count = candidate_counts.iter().sum::<f64>() / candidate_counts.len() as f64;
+    let mean_kept_ratio = kept_ratios.iter().sum::<f64>() / kept_ratios.len() as f64;
+    let mean_raw_conf_mean = raw_conf_means.iter().sum::<f64>() / raw_conf_means.len() as f64;
+    let p50_raw_conf_mean = percentile_f64(&raw_conf_means_sorted, 0.50);
+    let p90_raw_conf_mean = percentile_f64(&raw_conf_means_sorted, 0.90);
 
     Ok(EvalSummary {
         counts,
@@ -325,6 +395,13 @@ fn evaluate_model(
         mean_pair_latency_ms,
         p50_pair_latency_ms,
         pairs_per_sec,
+        mean_raw_keypoints0,
+        mean_raw_keypoints1,
+        mean_candidate_count,
+        mean_kept_ratio,
+        mean_raw_conf_mean,
+        p50_raw_conf_mean,
+        p90_raw_conf_mean,
     })
 }
 

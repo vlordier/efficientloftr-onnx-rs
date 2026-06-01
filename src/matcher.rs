@@ -61,6 +61,19 @@ pub struct MatchOutput {
     pub confidence: Vec<f32>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MatchDiagnostics {
+    pub raw_keypoints0_count: usize,
+    pub raw_keypoints1_count: usize,
+    pub raw_confidence_count: usize,
+    pub candidate_count: usize,
+    pub kept_count: usize,
+    pub kept_ratio: f32,
+    pub raw_conf_mean: f32,
+    pub raw_conf_p50: f32,
+    pub raw_conf_p90: f32,
+}
+
 #[derive(Debug)]
 pub enum EfficientLoftrError {
     Io(String),
@@ -112,7 +125,16 @@ impl EfficientLoftrMatcher {
         image0: &GrayscaleFrame,
         image1: &GrayscaleFrame,
     ) -> Result<MatchOutput, EfficientLoftrError> {
-        let mut batch = self.match_batch(&[image0], &[image1])?;
+        let (output, _) = self.match_pair_with_diagnostics(image0, image1)?;
+        Ok(output)
+    }
+
+    pub fn match_pair_with_diagnostics(
+        &mut self,
+        image0: &GrayscaleFrame,
+        image1: &GrayscaleFrame,
+    ) -> Result<(MatchOutput, MatchDiagnostics), EfficientLoftrError> {
+        let mut batch = self.match_batch_with_diagnostics(&[image0], &[image1])?;
         batch.pop().ok_or(EfficientLoftrError::InvalidImageShape)
     }
 
@@ -121,6 +143,18 @@ impl EfficientLoftrMatcher {
         images0: &[&GrayscaleFrame],
         images1: &[&GrayscaleFrame],
     ) -> Result<Vec<MatchOutput>, EfficientLoftrError> {
+        let outputs_with_diagnostics = self.match_batch_with_diagnostics(images0, images1)?;
+        Ok(outputs_with_diagnostics
+            .into_iter()
+            .map(|(output, _)| output)
+            .collect())
+    }
+
+    pub fn match_batch_with_diagnostics(
+        &mut self,
+        images0: &[&GrayscaleFrame],
+        images1: &[&GrayscaleFrame],
+    ) -> Result<Vec<(MatchOutput, MatchDiagnostics)>, EfficientLoftrError> {
         validate_batch_inputs(images0, images1)?;
 
         let input0 = make_nchw_tensor_batch(images0)?;
@@ -253,27 +287,15 @@ impl EfficientLoftrMatcher {
             let k1 = &k1_batches[batch_idx];
             let conf = &conf_batches[batch_idx];
 
-            let count = k0.len().min(k1.len()).min(conf.len());
-            let mut out0 = Vec::with_capacity(count);
-            let mut out1 = Vec::with_capacity(count);
-            let mut outc = Vec::with_capacity(count);
-            for i in 0..count {
-                if conf[i] < self.config.confidence_threshold {
-                    continue;
-                }
-                out0.push(k0[i]);
-                out1.push(k1[i]);
-                outc.push(conf[i]);
-                if outc.len() >= self.config.max_matches.max(1) {
-                    break;
-                }
-            }
+            let (output, diagnostics) = build_output_and_diagnostics(
+                k0,
+                k1,
+                conf,
+                self.config.confidence_threshold,
+                self.config.max_matches,
+            );
 
-            outputs.push(MatchOutput {
-                keypoints0: out0,
-                keypoints1: out1,
-                confidence: outc,
-            });
+            outputs.push((output, diagnostics));
         }
 
         Ok(outputs)
@@ -372,12 +394,79 @@ fn decode_confidence_batch(
     }
 }
 
+fn build_output_and_diagnostics(
+    keypoints0: &[[f32; 2]],
+    keypoints1: &[[f32; 2]],
+    confidence: &[f32],
+    confidence_threshold: f32,
+    max_matches: usize,
+) -> (MatchOutput, MatchDiagnostics) {
+    let candidate_count = keypoints0.len().min(keypoints1.len()).min(confidence.len());
+    let candidate_conf = &confidence[..candidate_count];
+    let mut out0 = Vec::with_capacity(candidate_count);
+    let mut out1 = Vec::with_capacity(candidate_count);
+    let mut outc = Vec::with_capacity(candidate_count);
+    for i in 0..candidate_count {
+        if candidate_conf[i] < confidence_threshold {
+            continue;
+        }
+        out0.push(keypoints0[i]);
+        out1.push(keypoints1[i]);
+        outc.push(candidate_conf[i]);
+        if outc.len() >= max_matches.max(1) {
+            break;
+        }
+    }
+
+    let mut sorted_conf = candidate_conf.to_vec();
+    sorted_conf.sort_by(|a, b| a.total_cmp(b));
+    let kept_count = outc.len();
+    let diagnostics = MatchDiagnostics {
+        raw_keypoints0_count: keypoints0.len(),
+        raw_keypoints1_count: keypoints1.len(),
+        raw_confidence_count: confidence.len(),
+        candidate_count,
+        kept_count,
+        kept_ratio: if candidate_count > 0 {
+            kept_count as f32 / candidate_count as f32
+        } else {
+            0.0
+        },
+        raw_conf_mean: if candidate_count > 0 {
+            candidate_conf.iter().sum::<f32>() / candidate_count as f32
+        } else {
+            0.0
+        },
+        raw_conf_p50: percentile_f32(&sorted_conf, 0.50),
+        raw_conf_p90: percentile_f32(&sorted_conf, 0.90),
+    };
+
+    (
+        MatchOutput {
+            keypoints0: out0,
+            keypoints1: out1,
+            confidence: outc,
+        },
+        diagnostics,
+    )
+}
+
+fn percentile_f32(sorted: &[f32], q: f64) -> f32 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let qq = q.clamp(0.0, 1.0);
+    let idx = (qq * ((sorted.len() - 1) as f64)).round() as usize;
+    sorted[idx]
+}
+
 #[cfg(test)]
 mod tests {
     use ndarray::Array;
 
     use super::{
-        GrayscaleFrame, decode_confidence_batch, decode_keypoints_batch, validate_batch_inputs,
+        GrayscaleFrame, build_output_and_diagnostics, decode_confidence_batch,
+        decode_keypoints_batch, validate_batch_inputs,
     };
 
     #[test]
@@ -431,5 +520,25 @@ mod tests {
         };
         assert!(validate_batch_inputs(&[&frame], &[&frame]).is_ok());
         assert!(validate_batch_inputs(&[&frame], &[&mismatch]).is_err());
+    }
+
+    #[test]
+    fn computes_output_diagnostics() {
+        let keypoints0 = vec![[1.0_f32, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let keypoints1 = vec![[7.0_f32, 8.0], [9.0, 10.0], [11.0, 12.0]];
+        let confidence = vec![0.1_f32, 0.5, 0.9];
+        let (output, diagnostics) =
+            build_output_and_diagnostics(&keypoints0, &keypoints1, &confidence, 0.2, 10);
+
+        assert_eq!(diagnostics.raw_keypoints0_count, 3);
+        assert_eq!(diagnostics.raw_keypoints1_count, 3);
+        assert_eq!(diagnostics.raw_confidence_count, 3);
+        assert_eq!(diagnostics.candidate_count, 3);
+        assert_eq!(diagnostics.kept_count, 2);
+        assert!((diagnostics.kept_ratio - (2.0 / 3.0)).abs() < 1e-6);
+        assert!((diagnostics.raw_conf_mean - 0.5).abs() < 1e-6);
+        assert!((diagnostics.raw_conf_p50 - 0.5).abs() < 1e-6);
+        assert!((diagnostics.raw_conf_p90 - 0.9).abs() < 1e-6);
+        assert_eq!(output.confidence.len(), 2);
     }
 }

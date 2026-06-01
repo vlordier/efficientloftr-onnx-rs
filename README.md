@@ -212,8 +212,13 @@ cargo run --release --bin eval_video_frames -- \
   --output-csv outputs/quantized/eval_pairs.csv
 ```
 
-`eval_pairs.csv` includes per-pair latency columns (`batch_latency_ms`, `per_pair_latency_ms`) and
-`eval_summary.csv` includes aggregate speed metrics (`mean_pair_latency_ms`, `p50_pair_latency_ms`, `pairs_per_sec`).
+`eval_pairs.csv` includes per-pair latency columns (`batch_latency_ms`, `per_pair_latency_ms`) plus
+raw/filtered match diagnostics (`raw_keypoints0_count`, `raw_keypoints1_count`, `candidate_count`,
+`kept_ratio`, `raw_conf_mean`, `raw_conf_p50`, `raw_conf_p90`).
+
+`eval_summary.csv` includes aggregate speed metrics (`mean_pair_latency_ms`, `p50_pair_latency_ms`,
+`pairs_per_sec`) plus aggregate diagnostics (`mean_raw_keypoints0`, `mean_raw_keypoints1`,
+`mean_candidate_count`, `mean_kept_ratio`, `mean_raw_conf_mean`, `p50_raw_conf_mean`, `p90_raw_conf_mean`).
 
 ## Quantization sweep
 
