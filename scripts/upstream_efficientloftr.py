@@ -343,6 +343,9 @@ def _patch_fine_matching_for_export(matcher: nn.Module, export_safe: bool = Fals
         conf_flat = softmax_matrix_f.reshape(m, ww * ww)
         mconf, idx = torch.topk(conf_flat, k=1, dim=-1, largest=True, sorted=True)
         mconf = mconf.squeeze(-1)
+        # Keep invalid coarse rows invalid after fine confidence refinement.
+        if "mconf" in data:
+            mconf = torch.where(data["mconf"] > 0, mconf, data["mconf"])
         idx_l = idx // ww
         idx_r = idx % ww
 
