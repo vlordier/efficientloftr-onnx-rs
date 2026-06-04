@@ -62,6 +62,7 @@ int main(int argc, char** argv)
     fill_random(in1, 1337u);
 
     ncnn::Extractor ex = net.create_extractor();
+    ex.set_light_mode(false);
 
     if (ex.input("in0", in0) != 0)
     {
